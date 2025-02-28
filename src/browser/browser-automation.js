@@ -429,160 +429,171 @@ async function joinTwitterSpace(browserObj, spaceUrl) {
   
   try {
     // Navigate to the Twitter Space URL
-    logger.info(`Navigating to Twitter Space URL: ${spaceUrl}`);
-    await page.goto(spaceUrl, { 
-      waitUntil: 'domcontentloaded',
-      timeout: 60000 
-    });
+    logger.info(`Navigating to ${spaceUrl}`);
+    await page.goto(spaceUrl, { waitUntil: 'domcontentloaded' });
     
     // Wait for the page to stabilize
+    logger.info('Waiting for page to stabilize...');
     await page.waitForTimeout(5000);
     
-    // Take a screenshot of the Space page
-    await page.screenshot({ path: path.join(logsDir, 'space-page-initial.png') });
+    // Take a screenshot before checking the space
+    const screenshotPath = path.join(__dirname, '../../logs', `space-before-check-${Date.now()}.png`);
+    await page.screenshot({ path: screenshotPath });
+    logger.info(`Screenshot saved to: ${screenshotPath}`);
     
-    // Validate that this is a Twitter Space
+    // Check if the space is valid
+    logger.info('Checking if the space is valid...');
     const isValidSpace = await page.evaluate(() => {
-      return document.body.innerText.includes('Space') || 
-             document.body.innerText.includes('Spaces') ||
-             document.body.innerText.includes('Listening') ||
-             document.body.innerText.includes('Start listening');
+      // Look for elements that indicate a valid space
+      const spaceTitle = document.querySelector('[data-testid="audioSpaceTitle"]');
+      const spaceHost = document.querySelector('[data-testid="audioSpaceHostInfo"]');
+      
+      return !!spaceTitle || !!spaceHost;
     });
     
     if (!isValidSpace) {
-      logger.error('This does not appear to be a valid Twitter Space');
-      await page.screenshot({ path: path.join(logsDir, 'invalid-space.png') });
-      throw new Error('Invalid Twitter Space URL');
+      logger.error('Invalid Twitter Space: Space may have ended or does not exist');
+      const errorScreenshotPath = path.join(__dirname, '../../logs', `invalid-space-${Date.now()}.png`);
+      await page.screenshot({ path: errorScreenshotPath });
+      logger.info(`Error screenshot saved to: ${errorScreenshotPath}`);
+      throw new Error('Invalid Twitter Space: Space may have ended or does not exist');
     }
     
-    // Check if the Space has ended
-    const hasEnded = await page.evaluate(() => {
-      return document.body.innerText.includes('This Space has ended') ||
-             document.body.innerText.includes('Space ended');
-    });
-    
-    if (hasEnded) {
-      logger.error('This Twitter Space has already ended');
-      await page.screenshot({ path: path.join(logsDir, 'space-ended.png') });
-      throw new Error('This Twitter Space has already ended');
-    }
-    
-    // Check if we're already in the Space
+    // Check if we're already in the space
+    logger.info('Checking if already in the space...');
     const alreadyInSpace = await page.evaluate(() => {
-      return document.body.innerText.includes('Listening') &&
-             !document.body.innerText.includes('Start listening');
+      // Look for elements that indicate we're already in the space
+      const leaveButton = document.querySelector('[data-testid="leaveSpace"]');
+      const audioControls = document.querySelector('[data-testid="audioSpaceControls"]');
+      
+      return !!leaveButton || !!audioControls;
     });
     
     if (alreadyInSpace) {
-      logger.info('Already listening to this Twitter Space');
-      return { browser, page, context };
+      logger.info('Already in the Twitter Space');
+      return;
     }
     
-    // Find and click the "Start listening" button
+    // Check for rate limiting
+    const isRateLimited = await page.evaluate(() => {
+      return document.body.textContent.includes('Rate limit exceeded') || 
+             document.body.textContent.includes('Too many requests');
+    });
+    
+    if (isRateLimited) {
+      logger.error('Twitter rate limit exceeded. Waiting before retrying...');
+      const rateLimitScreenshot = path.join(__dirname, '../../logs', `rate-limit-${Date.now()}.png`);
+      await page.screenshot({ path: rateLimitScreenshot });
+      logger.info(`Rate limit screenshot saved to: ${rateLimitScreenshot}`);
+      
+      // Wait for 2 minutes before retrying
+      logger.info('Waiting for 2 minutes before retrying...');
+      await page.waitForTimeout(120000);
+      
+      // Refresh the page and try again
+      logger.info('Refreshing page to retry...');
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await page.waitForTimeout(5000);
+    }
+    
+    // Try to find and click the "Start listening" button
     logger.info('Looking for "Start listening" button...');
     
     // Take a screenshot before clicking
-    await page.screenshot({ path: path.join(logsDir, 'before-start-listening.png') });
+    const beforeClickScreenshot = path.join(__dirname, '../../logs', `before-click-${Date.now()}.png`);
+    await page.screenshot({ path: beforeClickScreenshot });
+    logger.info(`Before click screenshot saved to: ${beforeClickScreenshot}`);
     
-    const listenButtonSelectors = [
+    // Try multiple selectors for the "Start listening" button
+    const buttonSelectors = [
+      '[data-testid="startListeningButton"]',
       'div[role="button"]:has-text("Start listening")',
-      'span:has-text("Start listening")',
-      'div[data-testid="audioSpaceStartListening"]',
-      'div[data-testid="audioSpaceJoinButton"]'
+      'div[role="button"]:has-text("Listen")',
+      'div[data-testid="audioSpaceBarPlayButton"]'
     ];
     
-    let listenButton = null;
+    let buttonClicked = false;
     
-    for (const selector of listenButtonSelectors) {
+    for (const selector of buttonSelectors) {
       try {
-        logger.info(`Trying selector: ${selector}`);
-        listenButton = await page.waitForSelector(selector, { timeout: 5000 });
-        if (listenButton) {
-          logger.info(`Found "Start listening" button with selector: ${selector}`);
+        logger.info(`Trying to find button with selector: ${selector}`);
+        const button = await page.$(selector);
+        
+        if (button) {
+          logger.info(`Found button with selector: ${selector}, clicking...`);
+          await button.click();
+          buttonClicked = true;
+          logger.info('Button clicked successfully');
           break;
         }
       } catch (error) {
-        // Continue to the next selector
+        logger.warn(`Failed to click button with selector ${selector}: ${error.message}`);
       }
     }
     
-    if (!listenButton) {
-      logger.warn('Could not find "Start listening" button with standard selectors');
+    // If we couldn't find the button with selectors, try a more aggressive approach
+    if (!buttonClicked) {
+      logger.warn('Could not find "Start listening" button with selectors, trying JavaScript click...');
       
-      // Try a more aggressive approach - look for any button-like element
       try {
-        logger.info('Trying to find any button-like element...');
-        
-        // Try to click using JavaScript
-        const clicked = await page.evaluate(() => {
-          // Look for elements that might be the join button
-          const possibleButtons = [
-            ...Array.from(document.querySelectorAll('div[role="button"]')),
-            ...Array.from(document.querySelectorAll('button')),
-            ...Array.from(document.querySelectorAll('[data-testid*="join"]')),
-            ...Array.from(document.querySelectorAll('[data-testid*="listen"]'))
-          ];
+        // Try to click any button that contains "Start listening" or "Listen" text
+        buttonClicked = await page.evaluate(() => {
+          const buttons = Array.from(document.querySelectorAll('div[role="button"]'));
+          const listenButton = buttons.find(button => 
+            button.textContent.includes('Start listening') || 
+            button.textContent.includes('Listen')
+          );
           
-          // Filter to those that might be related to joining/listening
-          const likelyButtons = possibleButtons.filter(el => {
-            const text = el.innerText.toLowerCase();
-            return text.includes('listen') || 
-                   text.includes('join') || 
-                   text.includes('start') ||
-                   text.includes('space');
-          });
-          
-          if (likelyButtons.length > 0) {
-            likelyButtons[0].click();
+          if (listenButton) {
+            listenButton.click();
             return true;
           }
           
           return false;
         });
         
-        if (clicked) {
-          logger.info('Clicked a potential "Start listening" button using JavaScript');
+        if (buttonClicked) {
+          logger.info('Successfully clicked button using JavaScript');
         } else {
-          logger.error('Could not find any element that looks like a "Start listening" button');
-          await page.screenshot({ path: path.join(logsDir, 'no-listen-button.png') });
-          throw new Error('Could not find "Start listening" button');
+          logger.warn('Could not find any button with "Start listening" or "Listen" text');
         }
       } catch (error) {
-        logger.error(`Error trying to find and click button: ${error.message}`);
-        await page.screenshot({ path: path.join(logsDir, 'listen-button-error.png') });
-        throw new Error('Could not find "Start listening" button');
+        logger.error(`Error during JavaScript click: ${error.message}`);
       }
-    } else {
-      // Click the button if found
-      await listenButton.click();
-      logger.info('Clicked "Start listening" button');
     }
-    
-    // Wait for the Space to load
-    await page.waitForTimeout(5000);
     
     // Take a screenshot after clicking
-    await page.screenshot({ path: path.join(logsDir, 'after-start-listening.png') });
+    await page.waitForTimeout(2000);
+    const afterClickScreenshot = path.join(__dirname, '../../logs', `after-click-${Date.now()}.png`);
+    await page.screenshot({ path: afterClickScreenshot });
+    logger.info(`After click screenshot saved to: ${afterClickScreenshot}`);
     
-    // Verify that we've joined the Space
-    const hasJoined = await page.evaluate(() => {
-      return document.body.innerText.includes('Listening') ||
-             document.body.innerText.includes('Live') ||
-             document.body.innerText.includes('Tuned in');
+    // Wait for the space to load
+    logger.info('Waiting for space to load...');
+    await page.waitForTimeout(5000);
+    
+    // Verify we're in the space
+    const inSpace = await page.evaluate(() => {
+      const leaveButton = document.querySelector('[data-testid="leaveSpace"]');
+      const audioControls = document.querySelector('[data-testid="audioSpaceControls"]');
+      
+      return !!leaveButton || !!audioControls;
     });
     
-    if (!hasJoined) {
-      logger.warn('Could not verify that we joined the Space');
-      // Continue anyway as the UI might have changed
+    if (!inSpace) {
+      logger.warn('Could not verify that we joined the space. Taking a screenshot...');
+      const verifyScreenshot = path.join(__dirname, '../../logs', `verify-join-${Date.now()}.png`);
+      await page.screenshot({ path: verifyScreenshot });
+      logger.info(`Verification screenshot saved to: ${verifyScreenshot}`);
+    } else {
+      logger.info('Successfully joined the Twitter Space');
     }
     
-    logger.info('Successfully joined Twitter Space');
-    return { browser, page, context };
   } catch (error) {
-    logger.error(`Failed to join Twitter Space: ${error.message}`);
-    if (page) {
-      await page.screenshot({ path: path.join(logsDir, 'space-join-error.png') });
-    }
+    logger.error(`Error joining Twitter Space: ${error.message}`);
+    const errorScreenshot = path.join(__dirname, '../../logs', `join-error-${Date.now()}.png`);
+    await page.screenshot({ path: errorScreenshot }).catch(e => logger.error(`Failed to take error screenshot: ${e.message}`));
+    logger.info(`Error screenshot saved to: ${errorScreenshot}`);
     throw error;
   }
 }

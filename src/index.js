@@ -5,8 +5,8 @@ const { Command } = require('commander');
 const logger = require('./utils/logger');
 const { provisionVM, terminateVM } = require('./azure/vm-manager');
 const { launchBrowser, loginToTwitter, joinTwitterSpace } = require('./browser/browser-automation');
-const { setupAudioCapture, startRecording, stopRecording } = require('./audio/audio-capture');
-const { connectToWebSocket, sendAudioChunk } = require('./audio/websocket-client');
+const { setupAudioCapture, startRecording, stopRecording, connectToWebSocket } = require('./audio/audio-capture');
+const { sendAudioChunk } = require('./audio/websocket-client');
 const fs = require('fs');
 const path = require('path');
 
@@ -54,18 +54,23 @@ let wsConnection = null;
  * Main application flow
  */
 async function main() {
-  logger.info('Starting Twitter Space Audio Capture');
-  logger.info(`Target Twitter Space: ${options.url}`);
-  logger.info(`WebSocket Endpoint: ${websocketEndpoint}`);
-  logger.info(`Headless Mode: ${isHeadless ? 'Enabled' : 'Disabled'}`);
-
-  // Create logs directory if it doesn't exist
-  const logsDir = path.join(__dirname, '../logs');
-  if (!fs.existsSync(logsDir)) {
-    fs.mkdirSync(logsDir, { recursive: true });
-  }
-
+  let browser = null;
+  let page = null;
+  let audioCapture = null;
+  let wsConnection = null;
+  
   try {
+    logger.info('Starting Twitter Space Audio Capture');
+    logger.info(`Target Twitter Space: ${options.url}`);
+    logger.info(`WebSocket Endpoint: ${websocketEndpoint}`);
+    logger.info(`Headless Mode: ${isHeadless ? 'Enabled' : 'Disabled'}`);
+
+    // Create logs directory if it doesn't exist
+    const logsDir = path.join(__dirname, '../logs');
+    if (!fs.existsSync(logsDir)) {
+      fs.mkdirSync(logsDir, { recursive: true });
+    }
+
     // Validate required parameters
     if (!options.url) {
       throw new Error('Twitter Space URL is required. Use --url option.');
@@ -114,55 +119,81 @@ async function main() {
     // Step 5: Setup audio capture
     logger.info('Setting up audio capture...');
     audioCapture = await setupAudioCapture(spaceObj.page);
+    logger.info('Audio capture setup complete');
     
-    // Step 6: Connect to WebSocket endpoint
-    logger.info(`Connecting to WebSocket: ${websocketEndpoint}`);
-    wsConnection = await connectToWebSocket(websocketEndpoint);
-    
-    // Step 7: Start recording and streaming
-    logger.info('Starting audio recording and streaming...');
-    await startRecording(audioCapture, async (chunk) => {
+    // Connect to WebSocket endpoint if provided
+    if (options.websocket) {
       try {
-        await sendAudioChunk(wsConnection, chunk);
+        logger.info(`Connecting to WebSocket endpoint: ${options.websocket}`);
+        wsConnection = await connectToWebSocket(options.websocket, audioCapture);
+        logger.info('WebSocket connection established');
       } catch (error) {
-        logger.error(`Error sending audio chunk: ${error.message}`);
-        // Don't throw here to keep recording even if sending fails
-      }
-    });
-    
-    // Keep the process running until user terminates
-    logger.info('Recording in progress. Press Ctrl+C to stop.');
-    
-    // Handle graceful shutdown
-    process.on('SIGINT', async () => {
-      logger.info('Received SIGINT signal. Starting cleanup...');
-      await cleanup();
-      process.exit(0);
-    });
-    
-    process.on('SIGTERM', async () => {
-      logger.info('Received SIGTERM signal. Starting cleanup...');
-      await cleanup();
-      process.exit(0);
-    });
-    
-  } catch (error) {
-    logger.error(`Error in main process: ${error.message}`);
-    logger.debug(error.stack);
-    
-    // Save error screenshot if browser is available
-    if (browser) {
-      try {
-        const context = await browser.newContext();
-        const page = await context.newPage();
-        await page.screenshot({ path: path.join(logsDir, 'error-screenshot.png') });
-        logger.info('Saved error screenshot to logs/error-screenshot.png');
-      } catch (screenshotError) {
-        logger.error(`Failed to save error screenshot: ${screenshotError.message}`);
+        logger.error(`Failed to connect to WebSocket: ${error.message}`);
+        logger.info('Continuing without WebSocket connection');
       }
     }
     
-    await cleanup();
+    // Start recording
+    logger.info('Starting audio recording...');
+    await startRecording(audioCapture, wsConnection);
+    logger.info('Audio recording started');
+    
+    // Setup graceful shutdown
+    const shutdown = async (signal) => {
+      logger.info(`Received ${signal || 'shutdown'} signal, cleaning up...`);
+      
+      try {
+        // Stop recording if active
+        if (audioCapture) {
+          logger.info('Stopping audio recording...');
+          await stopRecording(audioCapture, wsConnection);
+          logger.info('Audio recording stopped');
+        }
+        
+        // Close browser if open
+        if (browser) {
+          logger.info('Closing browser...');
+          await browser.close();
+          logger.info('Browser closed');
+        }
+        
+        logger.info('Cleanup complete, exiting...');
+        process.exit(0);
+      } catch (error) {
+        logger.error(`Error during shutdown: ${error.message}`);
+        process.exit(1);
+      }
+    };
+    
+    // Register signal handlers
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('uncaughtException', (error) => {
+      logger.error(`Uncaught exception: ${error.message}`);
+      logger.error(error.stack);
+      shutdown('uncaughtException');
+    });
+    
+    // Keep the process running until user terminates
+    logger.info('Process running, press Ctrl+C to stop...');
+    
+  } catch (error) {
+    logger.error(`Error in main process: ${error.message}`);
+    logger.error(error.stack);
+    
+    // Cleanup on error
+    try {
+      if (audioCapture) {
+        await stopRecording(audioCapture, wsConnection);
+      }
+      
+      if (browser) {
+        await browser.close();
+      }
+    } catch (cleanupError) {
+      logger.error(`Error during cleanup: ${cleanupError.message}`);
+    }
+    
     process.exit(1);
   }
 }
