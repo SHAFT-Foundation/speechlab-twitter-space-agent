@@ -8,12 +8,12 @@
  */
 
 require('dotenv').config();
-const { findMostPopularSpace } = require('./src/browser/spaces-discovery');
+const { Command } = require('commander');
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const logger = require('./src/utils/logger');
-const { Command } = require('commander');
+const { discoverTwitterSpaces, findMostPopularSpace, findSpacesByQuery } = require('./src/browser/spaces-discovery');
 
 // Configure CLI
 const program = new Command();
@@ -24,6 +24,7 @@ program
   .option('-u, --url <url>', 'Twitter Space URL to capture')
   .option('-d, --debug', 'Enable debug logging')
   .option('-t, --test-mode', 'Run in test mode', true)
+  .option('-w, --websocket <endpoint>', 'WebSocket endpoint')
   .parse(process.argv);
 
 const options = program.opts();
@@ -55,85 +56,87 @@ Captured At: ${new Date().toISOString()}
 
 /**
  * Start capturing a Twitter Space
- * @param {string|Object} space - Twitter Space URL or object
- * @returns {Promise<Object>} Process information
+ * @param {string|Object} space - Twitter Space URL or space object
+ * @returns {Promise<Object>} Capture process information
  */
-function startCapturingSpace(space) {
-  return new Promise((resolve, reject) => {
-    // Convert string URL to space object if needed
-    const spaceObj = typeof space === 'string' 
-      ? { url: space, title: 'Direct URL Capture' } 
-      : space;
-    
-    // Log detailed space information
-    const spaceDetails = formatSpaceDetails(spaceObj);
-    console.log(spaceDetails);
-    logger.info(`Starting capture of Twitter Space: ${spaceObj.title || spaceObj.url}`);
-    logger.info(`URL: ${spaceObj.url}`);
-    
-    // Save space info to a file for reference
-    const spaceInfoFile = path.join(__dirname, 'current-space.json');
-    fs.writeFileSync(
-      spaceInfoFile,
-      JSON.stringify({
-        ...spaceObj,
-        captureStartedAt: new Date().toISOString()
-      }, null, 2),
-      'utf8'
-    );
-    
-    // Also save the formatted details to a text file for easy reference
-    const spaceDetailsFile = path.join(__dirname, 'current-space-details.txt');
-    fs.writeFileSync(spaceDetailsFile, spaceDetails, 'utf8');
-    logger.info(`Space details saved to: ${spaceDetailsFile}`);
-    
-    // Build command arguments
-    const cmdArgs = [
-      path.join(__dirname, 'src', 'index.js'),
-      '--url', spaceObj.url
-    ];
-    
-    if (options.testMode) {
-      cmdArgs.push('--test-mode');
-    }
-    
-    if (options.debug) {
-      cmdArgs.push('--debug');
-    }
-    
-    // Execute the capture command
-    const captureProcess = spawn('node', cmdArgs, {
-      stdio: 'inherit'
-    });
-    
-    // Handle process events
-    captureProcess.on('error', (error) => {
-      logger.error(`Failed to start capture process: ${error.message}`);
-      reject(error);
-    });
-    
-    captureProcess.on('exit', (code, signal) => {
-      if (code !== 0) {
-        logger.error(`Capture process exited with code ${code} and signal ${signal}`);
-        reject(new Error(`Process exited with code ${code}`));
-      } else {
-        logger.info('Capture process completed successfully');
-        resolve();
-      }
-    });
-    
-    // Return process info
-    resolve({
-      process: captureProcess,
-      space: spaceObj,
-      pid: captureProcess.pid
-    });
-    
-    // Log PID for potential manual termination
-    logger.info(`Capture process started with PID: ${captureProcess.pid}`);
-    console.log(`\nCapture process running with PID: ${captureProcess.pid}`);
-    console.log('Press Ctrl+C to stop the capture process.');
+async function startCapturingSpace(space) {
+  // Extract the URL if a space object was provided
+  const spaceUrl = typeof space === 'string' ? space : space.url;
+  const spaceTitle = typeof space === 'string' ? 'Direct URL Capture' : space.title;
+  const spaceHost = typeof space === 'string' ? '' : space.host;
+  const spaceListeners = typeof space === 'string' ? '' : space.listeners;
+  
+  // Create a details file with information about the space
+  const detailsPath = path.join(process.cwd(), 'current-space-details.txt');
+  const details = `
+=================================================
+TWITTER SPACE DETAILS:
+=================================================
+Title: ${spaceTitle}
+URL: ${spaceUrl}
+${spaceHost ? `Host: ${spaceHost}` : ''}
+${spaceListeners ? `Listeners: ${spaceListeners}` : ''}
+
+
+Captured At: ${new Date().toISOString()}
+=================================================
+`;
+
+  fs.writeFileSync(detailsPath, details);
+  
+  // Log the details
+  console.log(details);
+  
+  // Start the capture process
+  logger.info(`Starting capture of Twitter Space: ${spaceTitle}`);
+  logger.info(`URL: ${spaceUrl}`);
+  logger.info(`Space details saved to: ${detailsPath}`);
+  
+  // Build the command arguments
+  const args = [
+    path.join(__dirname, 'src/index.js'),
+    '--url', spaceUrl
+  ];
+  
+  // Add debug flag if needed
+  if (options.debug) {
+    args.push('--debug');
+  }
+  
+  // Add test mode flag if needed
+  if (options.testMode) {
+    args.push('--test-mode');
+  }
+  
+  // Add websocket endpoint if specified
+  if (options.websocket) {
+    args.push('--websocket', options.websocket);
+  }
+  
+  // Start the capture process
+  const captureProcess = spawn('node', args, {
+    stdio: 'inherit'
   });
+  
+  logger.info(`Capture process started with PID: ${captureProcess.pid}`);
+  console.log(`\nCapture process running with PID: ${captureProcess.pid}`);
+  console.log(`Press Ctrl+C to stop the capture process.`);
+  
+  // Handle process events
+  captureProcess.on('exit', (code, signal) => {
+    logger.info(`Capture process exited with code ${code} and signal ${signal}`);
+  });
+  
+  captureProcess.on('error', (error) => {
+    logger.error(`Capture process error: ${error.message}`);
+  });
+  
+  return {
+    process: captureProcess,
+    pid: captureProcess.pid,
+    url: spaceUrl,
+    title: spaceTitle
+  };
 }
 
 /**
@@ -260,8 +263,12 @@ async function main() {
     logger.info('Finding the most popular Twitter Space...');
     
     try {
+      // Use our discovery module to find active spaces
+      logger.debug('Using spaces-discovery module to find active Twitter Spaces');
       const popularSpace = await findMostPopularSpace({
-        language: 'en' // Default to English spaces
+        language: 'en', // Default to English spaces
+        mode: 'top',    // Get top spaces
+        limit: 5        // Check top 5 spaces
       });
       
       if (!popularSpace) {
@@ -271,6 +278,8 @@ async function main() {
       }
       
       console.log("\n✅ Found popular Twitter Space!");
+      logger.info(`Found popular Twitter Space: "${popularSpace.title}" by ${popularSpace.host} (${popularSpace.listeners} listeners)`);
+      logger.info(`Space URL: ${popularSpace.url}`);
       
       // Start capturing the space
       const captureInfo = await startCapturingSpace(popularSpace);

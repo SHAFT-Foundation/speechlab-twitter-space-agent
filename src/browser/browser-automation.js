@@ -195,11 +195,17 @@ async function joinTwitterSpace(page, spaceUrl) {
   }
   
   try {
-    // Navigate to Twitter Space URL
+    // Navigate to Twitter Space URL with a shorter timeout
     logger.debug(`Navigating to Twitter Space: ${spaceUrl}`);
-    await page.goto(spaceUrl, { waitUntil: 'networkidle' });
-    await page.waitForLoadState('domcontentloaded');
-    await page.waitForTimeout(2000);
+    
+    // Use a more reliable navigation strategy
+    await page.goto(spaceUrl, { 
+      waitUntil: 'domcontentloaded',
+      timeout: 30000 
+    });
+    
+    // Wait for the page to stabilize
+    await page.waitForTimeout(5000);
     
     // Take a screenshot for debugging
     await page.screenshot({ path: 'space-loaded.png' });
@@ -210,22 +216,52 @@ async function joinTwitterSpace(page, spaceUrl) {
     
     // Twitter has different selectors depending on the status of the Space
     // We'll check for both "Listen live" and "Play recording" buttons
-    const buttonSelector = await Promise.race([
-      page.waitForSelector('div[role="button"]:has-text("Listen live")', { timeout: 30000 })
-        .then(() => 'div[role="button"]:has-text("Listen live")'),
-      page.waitForSelector('div[role="button"]:has-text("Play recording")', { timeout: 30000 })
-        .then(() => 'div[role="button"]:has-text("Play recording")'),
-      page.waitForSelector('div[data-testid="audioSpacePlayButton"]', { timeout: 30000 })
-        .then(() => 'div[data-testid="audioSpacePlayButton"]'),
-      page.waitForSelector('[data-testid="audioSpace-audioOnlyPlayButton"]', { timeout: 30000 })
-        .then(() => '[data-testid="audioSpace-audioOnlyPlayButton"]')
-    ]).catch(error => {
-      logger.error(`Failed to find play button: ${error.message}`);
+    const buttonSelectors = [
+      'div[role="button"]:has-text("Listen live")',
+      'div[role="button"]:has-text("Play recording")',
+      'div[data-testid="audioSpacePlayButton"]',
+      '[data-testid="audioSpace-audioOnlyPlayButton"]'
+    ];
+    
+    // Try to find any of the play buttons
+    let buttonFound = false;
+    let buttonSelector = null;
+    
+    for (const selector of buttonSelectors) {
+      logger.debug(`Looking for button with selector: ${selector}`);
+      const button = await page.$(selector);
+      if (button) {
+        buttonFound = true;
+        buttonSelector = selector;
+        logger.debug(`Found button with selector: ${selector}`);
+        break;
+      }
+    }
+    
+    if (!buttonFound) {
+      logger.error('Could not find any play button on the page');
       // Take a screenshot to see what's on the page
-      page.screenshot({ path: 'space-no-button.png' });
+      await page.screenshot({ path: 'space-no-button.png' });
       logger.debug('Saved screenshot to space-no-button.png');
-      throw error;
-    });
+      
+      // Check if we're on the right page at least
+      const pageTitle = await page.title();
+      logger.debug(`Page title: ${pageTitle}`);
+      
+      // Try to get some content from the page to debug
+      const pageContent = await page.evaluate(() => {
+        return {
+          title: document.title,
+          url: window.location.href,
+          hasSpaceElements: document.querySelector('[data-testid="audioSpaceTitle"]') !== null,
+          bodyText: document.body.innerText.substring(0, 500) // First 500 chars
+        };
+      });
+      
+      logger.debug('Page content:', pageContent);
+      
+      throw new Error('Could not find play button for Twitter Space');
+    }
     
     // Take a screenshot before clicking play
     await page.screenshot({ path: 'space-before-play.png' });
