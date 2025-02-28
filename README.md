@@ -1,6 +1,12 @@
 # Twitter Space Audio Capture
 
-A Node.js automation tool that captures audio from Twitter Spaces and streams it to a WebSocket endpoint. This tool is designed for the SpeechLab Twitter Space live translation agent, enabling those who do not know English to participate and learn!
+A Node.js automation tool that captures audio from X(Twitter) Spaces and streams it to a WebSocket endpoint. A X(Twitter) Spaces live speech-to-speech interpretation agent that empowers everyone to participate and learn regardless of language.
+
+
+
+
+
+
 
 ## Features
 
