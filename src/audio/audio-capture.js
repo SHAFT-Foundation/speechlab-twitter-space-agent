@@ -13,13 +13,31 @@ async function setupAudioCapture(page) {
   logger.info('Setting up audio capture...');
   
   try {
+    // Check if page is still open
+    if (!page || page.isClosed()) {
+      throw new Error('Page is closed or not available');
+    }
+    
     // Wait for audio to be available
     logger.info('Waiting for audio to be available...');
-    await page.waitForTimeout(5000);
+    try {
+      await page.waitForTimeout(5000);
+    } catch (error) {
+      logger.error(`Error waiting for audio: ${error.message}`);
+      throw new Error(`Failed to wait for audio: ${error.message}`);
+    }
+    
+    // Check if page is still open after waiting
+    if (!page || page.isClosed()) {
+      throw new Error('Page was closed while waiting for audio');
+    }
     
     // Check if we can access the audio context
     const audioContextAvailable = await page.evaluate(() => {
       return typeof AudioContext !== 'undefined' || typeof webkitAudioContext !== 'undefined';
+    }).catch(error => {
+      logger.error(`Error checking audio context: ${error.message}`);
+      return false;
     });
     
     if (!audioContextAvailable) {
@@ -109,6 +127,9 @@ async function setupAudioCapture(page) {
           return true;
         }
       };
+    }).catch(error => {
+      logger.error(`Error creating audio capture: ${error.message}`);
+      throw new Error(`Failed to create audio capture: ${error.message}`);
     });
     
     if (!audioCaptureObj) {
