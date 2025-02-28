@@ -1,11 +1,10 @@
 #!/usr/bin/env node
 
 /**
- * Auto-Capture Top Twitter Space
+ * Capture Twitter Space
  * 
- * This script automatically finds the most popular Twitter Space
- * and starts capturing its audio. It's designed for testing the
- * Twitter Space audio capture system with live content.
+ * This script captures audio from a specified Twitter Space URL
+ * or attempts to find a popular space if no URL is provided.
  */
 
 require('dotenv').config();
@@ -14,9 +13,23 @@ const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const logger = require('./src/utils/logger');
+const { Command } = require('commander');
+
+// Configure CLI
+const program = new Command();
+program
+  .name('capture-space')
+  .description('Capture audio from a Twitter Space')
+  .version('1.0.0')
+  .option('-u, --url <url>', 'Twitter Space URL to capture')
+  .option('-d, --debug', 'Enable debug logging')
+  .option('-t, --test-mode', 'Run in test mode', true)
+  .parse(process.argv);
+
+const options = program.opts();
 
 // Configure logging
-logger.level = process.env.LOG_LEVEL || 'info';
+logger.level = options.debug ? 'debug' : (process.env.LOG_LEVEL || 'info');
 
 /**
  * Format space information for display
@@ -28,39 +41,42 @@ function formatSpaceDetails(space) {
 =================================================
 TWITTER SPACE DETAILS:
 =================================================
-Title: ${space.title}
+Title: ${space.title || 'Unknown Title'}
 URL: ${space.url}
-Space ID: ${space.id || 'Unknown'}
-Host: ${space.host}
-Listeners: ${space.listeners}
-Status: ${space.status || 'Unknown'}
+${space.id ? `Space ID: ${space.id}` : ''}
+${space.host ? `Host: ${space.host}` : ''}
+${space.listeners ? `Listeners: ${space.listeners}` : ''}
+${space.status ? `Status: ${space.status}` : ''}
 ${space.timestamp ? `Time: ${space.timestamp}` : ''}
-Discovered At: ${space.discoveredAt || new Date().toISOString()}
+Captured At: ${new Date().toISOString()}
 =================================================
 `;
 }
 
 /**
  * Start capturing a Twitter Space
- * @param {Object} space - Twitter Space to capture
+ * @param {string|Object} space - Twitter Space URL or object
  * @returns {Promise<Object>} Process information
  */
 function startCapturingSpace(space) {
   return new Promise((resolve, reject) => {
+    // Convert string URL to space object if needed
+    const spaceObj = typeof space === 'string' 
+      ? { url: space, title: 'Direct URL Capture' } 
+      : space;
+    
     // Log detailed space information
-    const spaceDetails = formatSpaceDetails(space);
+    const spaceDetails = formatSpaceDetails(spaceObj);
     console.log(spaceDetails);
-    logger.info(`Starting capture of Twitter Space: "${space.title}"`);
-    logger.info(`URL: ${space.url}`);
-    logger.info(`Host: ${space.host}`);
-    logger.info(`Listeners: ${space.listeners}`);
+    logger.info(`Starting capture of Twitter Space: ${spaceObj.title || spaceObj.url}`);
+    logger.info(`URL: ${spaceObj.url}`);
     
     // Save space info to a file for reference
     const spaceInfoFile = path.join(__dirname, 'current-space.json');
     fs.writeFileSync(
       spaceInfoFile,
       JSON.stringify({
-        ...space,
+        ...spaceObj,
         captureStartedAt: new Date().toISOString()
       }, null, 2),
       'utf8'
@@ -71,13 +87,22 @@ function startCapturingSpace(space) {
     fs.writeFileSync(spaceDetailsFile, spaceDetails, 'utf8');
     logger.info(`Space details saved to: ${spaceDetailsFile}`);
     
-    // Execute the capture command
-    const captureProcess = spawn('node', [
+    // Build command arguments
+    const cmdArgs = [
       path.join(__dirname, 'src', 'index.js'),
-      '--url', space.url,
-      '--test-mode',
-      '--debug'
-    ], {
+      '--url', spaceObj.url
+    ];
+    
+    if (options.testMode) {
+      cmdArgs.push('--test-mode');
+    }
+    
+    if (options.debug) {
+      cmdArgs.push('--debug');
+    }
+    
+    // Execute the capture command
+    const captureProcess = spawn('node', cmdArgs, {
       stdio: 'inherit'
     });
     
@@ -100,7 +125,7 @@ function startCapturingSpace(space) {
     // Return process info
     resolve({
       process: captureProcess,
-      space: space,
+      space: spaceObj,
       pid: captureProcess.pid
     });
     
@@ -182,48 +207,50 @@ function startWebSocketServer() {
  */
 async function main() {
   try {
-    console.log("\n=== TWITTER SPACE AUTO-CAPTURE TOOL ===\n");
-    console.log("This tool will automatically find and capture the most popular Twitter Space");
-    console.log("for testing purposes.\n");
+    console.log("\n=== TWITTER SPACE CAPTURE TOOL ===\n");
     
     // Start WebSocket server if needed
     const serverInfo = await startWebSocketServer();
     
-    // Find the most popular Twitter Space
-    console.log("\nSearching for the most popular Twitter Space...");
-    logger.info('Finding the most popular Twitter Space...');
-    const popularSpace = await findMostPopularSpace({
-      language: 'en' // Default to English spaces
-    });
-    
-    if (!popularSpace) {
-      console.log("\n❌ No Twitter Spaces found. Please try again later.");
-      logger.error('No Twitter Spaces found. Please try again later.');
-      process.exit(1);
+    // Check if URL was provided
+    if (options.url) {
+      console.log(`\nCapturing Twitter Space from provided URL: ${options.url}\n`);
+      const captureInfo = await startCapturingSpace(options.url);
+      
+      // Handle graceful shutdown
+      setupShutdownHandler(captureInfo, serverInfo);
+      return;
     }
     
-    console.log("\n✅ Found popular Twitter Space!");
+    // If no URL provided, try to find a popular space
+    console.log("\nNo URL provided. Searching for the most popular Twitter Space...");
+    logger.info('Finding the most popular Twitter Space...');
     
-    // Start capturing the space
-    const captureInfo = await startCapturingSpace(popularSpace);
-    
-    // Handle graceful shutdown
-    process.on('SIGINT', async () => {
-      console.log("\n\nStopping capture process...");
-      logger.info('Stopping capture process...');
+    try {
+      const popularSpace = await findMostPopularSpace({
+        language: 'en' // Default to English spaces
+      });
       
-      if (captureInfo && captureInfo.process) {
-        captureInfo.process.kill();
+      if (!popularSpace) {
+        console.log("\n❌ No Twitter Spaces found. Please try again later or provide a URL directly.");
+        logger.error('No Twitter Spaces found. Please try again later.');
+        process.exit(1);
       }
       
-      if (serverInfo && serverInfo.process) {
-        serverInfo.process.kill();
-      }
+      console.log("\n✅ Found popular Twitter Space!");
       
-      logger.info('Cleanup complete. Exiting...');
-      console.log("Cleanup complete. Exiting...");
-      process.exit(0);
-    });
+      // Start capturing the space
+      const captureInfo = await startCapturingSpace(popularSpace);
+      
+      // Handle graceful shutdown
+      setupShutdownHandler(captureInfo, serverInfo);
+      
+    } catch (error) {
+      console.log(`\n❌ Error finding Twitter Spaces: ${error.message}`);
+      console.log("\nPlease provide a Twitter Space URL directly using the --url option:");
+      console.log("Example: ./capture-space.js --url https://twitter.com/i/spaces/your-space-id");
+      process.exit(1);
+    }
     
   } catch (error) {
     console.error(`\n❌ Error: ${error.message}`);
@@ -233,5 +260,27 @@ async function main() {
   }
 }
 
+/**
+ * Set up graceful shutdown handler
+ */
+function setupShutdownHandler(captureInfo, serverInfo) {
+  process.on('SIGINT', async () => {
+    console.log("\n\nStopping capture process...");
+    logger.info('Stopping capture process...');
+    
+    if (captureInfo && captureInfo.process) {
+      captureInfo.process.kill();
+    }
+    
+    if (serverInfo && serverInfo.process) {
+      serverInfo.process.kill();
+    }
+    
+    logger.info('Cleanup complete. Exiting...');
+    console.log("Cleanup complete. Exiting...");
+    process.exit(0);
+  });
+}
+
 // Run the main function
-main();
+main(); 
