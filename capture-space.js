@@ -151,54 +151,87 @@ function startWebSocketServer() {
       return resolve(null);
     }
     
-    logger.info('Starting local WebSocket server...');
+    // First check if the port is already in use
+    const net = require('net');
+    const port = 8080; // Default port for the test server
     
-    // Start the test server
-    const serverProcess = spawn('node', [
-      path.join(__dirname, 'test-server.js')
-    ], {
-      detached: true,
-      stdio: 'pipe' // Capture output
-    });
-    
-    // Handle server output
-    let serverOutput = '';
-    serverProcess.stdout.on('data', (data) => {
-      const output = data.toString();
-      serverOutput += output;
-      console.log(`[WebSocket Server] ${output.trim()}`);
-      
-      // Check if server is ready
-      if (output.includes('WebSocket server started on port')) {
-        logger.info('WebSocket server started successfully');
-        resolve({
-          process: serverProcess,
-          pid: serverProcess.pid
+    const tester = net.createServer()
+      .once('error', err => {
+        if (err.code === 'EADDRINUSE') {
+          logger.info('WebSocket server port 8080 is already in use, assuming server is running');
+          // Port is in use, assume server is already running
+          resolve({
+            isExisting: true,
+            pid: null
+          });
+        } else {
+          reject(err);
+        }
+      })
+      .once('listening', () => {
+        // Port is free, close the tester and start the actual server
+        tester.close(() => {
+          logger.info('Starting local WebSocket server...');
+          
+          // Start the test server
+          const serverProcess = spawn('node', [
+            path.join(__dirname, 'test-server.js')
+          ], {
+            detached: true,
+            stdio: 'pipe' // Capture output
+          });
+          
+          // Handle server output
+          let serverOutput = '';
+          serverProcess.stdout.on('data', (data) => {
+            const output = data.toString();
+            serverOutput += output;
+            console.log(`[WebSocket Server] ${output.trim()}`);
+            
+            // Check if server is ready
+            if (output.includes('WebSocket server started on port')) {
+              logger.info('WebSocket server started successfully');
+              resolve({
+                process: serverProcess,
+                pid: serverProcess.pid,
+                isExisting: false
+              });
+            }
+          });
+          
+          // Handle server errors
+          serverProcess.stderr.on('data', (data) => {
+            const errorOutput = data.toString();
+            console.error(`[WebSocket Server Error] ${errorOutput.trim()}`);
+            logger.error(`WebSocket server error: ${errorOutput}`);
+            
+            // If we see the EADDRINUSE error, assume server is already running
+            if (errorOutput.includes('EADDRINUSE')) {
+              logger.info('WebSocket server port is already in use, assuming server is running');
+              resolve({
+                isExisting: true,
+                pid: null
+              });
+            }
+          });
+          
+          // Handle process errors
+          serverProcess.on('error', (error) => {
+            logger.error(`Failed to start WebSocket server: ${error.message}`);
+            reject(error);
+          });
+          
+          // Set a timeout for server startup
+          setTimeout(() => {
+            if (serverOutput.includes('WebSocket server started on port')) {
+              return; // Already resolved
+            }
+            logger.error('WebSocket server failed to start within timeout period');
+            reject(new Error('WebSocket server startup timeout'));
+          }, 10000);
         });
-      }
-    });
-    
-    // Handle server errors
-    serverProcess.stderr.on('data', (data) => {
-      const errorOutput = data.toString();
-      console.error(`[WebSocket Server Error] ${errorOutput.trim()}`);
-      logger.error(`WebSocket server error: ${errorOutput}`);
-    });
-    
-    // Handle process errors
-    serverProcess.on('error', (error) => {
-      logger.error(`Failed to start WebSocket server: ${error.message}`);
-      reject(error);
-    });
-    
-    // Set a timeout for server startup
-    setTimeout(() => {
-      if (serverOutput.includes('WebSocket server started on port')) {
-        return; // Already resolved
-      }
-      logger.error('WebSocket server failed to start within timeout period');
-      reject(new Error('WebSocket server startup timeout'));
-    }, 10000);
+      })
+      .listen(port);
   });
 }
 
@@ -272,7 +305,9 @@ function setupShutdownHandler(captureInfo, serverInfo) {
       captureInfo.process.kill();
     }
     
-    if (serverInfo && serverInfo.process) {
+    // Only kill the server process if we started it (not if it was already running)
+    if (serverInfo && serverInfo.process && !serverInfo.isExisting) {
+      logger.info('Stopping WebSocket server...');
       serverInfo.process.kill();
     }
     

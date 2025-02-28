@@ -31,6 +31,12 @@ if (options.debug) {
 // Override websocket URL if provided in CLI
 const websocketEndpoint = options.websocket || process.env.WEBSOCKET_ENDPOINT;
 
+// Global variables for cleanup
+let vmInfo = null;
+let browser = null;
+let audioCapture = null;
+let wsConnection = null;
+
 /**
  * Main application flow
  */
@@ -38,11 +44,6 @@ async function main() {
   logger.info('Starting Twitter Space Audio Capture');
   logger.info(`Target Twitter Space: ${options.url}`);
   logger.info(`WebSocket Endpoint: ${websocketEndpoint}`);
-
-  let vmInfo = null;
-  let browser = null;
-  let audioCapture = null;
-  let wsConnection = null;
 
   try {
     // Step 1: Provision Azure VM if not in test mode
@@ -57,15 +58,15 @@ async function main() {
     browser = await launchBrowser(options.testMode ? null : vmInfo);
     
     logger.info('Logging into Twitter...');
-    await loginToTwitter(browser);
+    const authPage = await loginToTwitter(browser);
     
-    // Step 3: Join Twitter Space
+    // Step 3: Join Twitter Space using the same authenticated page
     logger.info(`Joining Twitter Space: ${options.url}`);
-    const page = await joinTwitterSpace(browser, options.url);
+    const spacePage = await joinTwitterSpace(authPage, options.url);
     
     // Step 4: Setup audio capture
     logger.info('Setting up audio capture...');
-    audioCapture = await setupAudioCapture(page);
+    audioCapture = await setupAudioCapture(spacePage);
     
     // Step 5: Connect to WebSocket endpoint
     logger.info(`Connecting to WebSocket: ${websocketEndpoint}`);
@@ -100,27 +101,32 @@ async function main() {
 async function cleanup() {
   logger.info('Cleaning up resources...');
   
-  if (audioCapture) {
-    logger.info('Stopping audio recording...');
-    await stopRecording(audioCapture);
+  try {
+    if (audioCapture) {
+      logger.info('Stopping audio recording...');
+      await stopRecording(audioCapture);
+    }
+    
+    if (wsConnection) {
+      logger.info('Closing WebSocket connection...');
+      wsConnection.close();
+    }
+    
+    if (browser) {
+      logger.info('Closing browser...');
+      await browser.close();
+    }
+    
+    if (vmInfo && !options.keepVm) {
+      logger.info('Terminating Azure VM...');
+      await terminateVM(vmInfo.name);
+    }
+    
+    logger.info('Cleanup complete.');
+  } catch (error) {
+    logger.error(`Error during cleanup: ${error.message}`);
+    logger.debug(error.stack);
   }
-  
-  if (wsConnection) {
-    logger.info('Closing WebSocket connection...');
-    wsConnection.close();
-  }
-  
-  if (browser) {
-    logger.info('Closing browser...');
-    await browser.close();
-  }
-  
-  if (vmInfo && !options.keepVm) {
-    logger.info('Terminating Azure VM...');
-    await terminateVM(vmInfo.name);
-  }
-  
-  logger.info('Cleanup complete.');
 }
 
 // Run the application
