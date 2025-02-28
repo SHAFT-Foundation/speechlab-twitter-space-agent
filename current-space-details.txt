@@ -1,13 +1,2 @@
-
-=================================================
-TWITTER SPACE DETAILS:
-=================================================
-Title: Direct URL Capture
-URL: https://twitter.com/i/spaces/1YqJDqDgRmzxV
-
-
-
-
-
-Captured At: 2025-02-28T16:04:37.434Z
-=================================================
+Twitter Space URL: https://twitter.com/i/spaces/1YqKDZMrmZeJV
+Capture started: 2025-02-28T19:05:47.290Z

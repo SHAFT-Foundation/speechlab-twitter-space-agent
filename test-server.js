@@ -10,10 +10,21 @@ const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
 const winston = require('winston');
+const { Command } = require('commander');
+
+// Parse command line arguments
+const program = new Command();
+program
+  .option('-p, --port <port>', 'WebSocket server port', '8080')
+  .option('-d, --debug', 'Enable debug logging', false)
+  .option('-o, --output-dir <dir>', 'Output directory for received audio', './received-audio')
+  .parse(process.argv);
+
+const options = program.opts();
 
 // Configure logger
 const logger = winston.createLogger({
-  level: 'info',
+  level: options.debug ? 'debug' : 'info',
   format: winston.format.combine(
     winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
     winston.format.printf(({ level, message, timestamp }) => {
@@ -29,24 +40,27 @@ const logger = winston.createLogger({
         })
       )
     }),
-    new winston.transports.File({ filename: 'test-server.log' })
+    new winston.transports.File({ 
+      filename: `test-server-${options.port}.log` 
+    })
   ]
 });
 
 // Configuration
-const PORT = process.env.PORT || 8080;
+const PORT = parseInt(options.port, 10);
 const SAVE_AUDIO = true;
-const OUTPUT_DIR = path.join(__dirname, 'received-audio');
+const OUTPUT_DIR = path.resolve(options.outputDir);
 
 // Ensure output directory exists
 if (SAVE_AUDIO && !fs.existsSync(OUTPUT_DIR)) {
-  fs.mkdirSync(OUTPUT_DIR);
+  fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 }
 
 // Create WebSocket server
 const wss = new WebSocket.Server({ port: PORT });
 
 logger.info(`WebSocket server started on port ${PORT}`);
+logger.info(`Saving audio to: ${OUTPUT_DIR}`);
 logger.info(`Waiting for connections...`);
 
 // Handle connections
@@ -76,7 +90,7 @@ wss.on('connection', (ws, req) => {
           
           // Create output file if saving is enabled
           if (SAVE_AUDIO) {
-            const fileName = `twitter-space-${sessionId}.${audioFormat}`;
+            const fileName = `twitter-space-port${PORT}-${sessionId}.${audioFormat}`;
             const filePath = path.join(OUTPUT_DIR, fileName);
             logger.info(`Saving audio to: ${filePath}`);
             fileStream = fs.createWriteStream(filePath, { encoding: 'binary' });
@@ -86,7 +100,8 @@ wss.on('connection', (ws, req) => {
           ws.send(JSON.stringify({
             type: 'metadata_ack',
             status: 'ok',
-            sessionId: sessionId
+            sessionId: sessionId,
+            port: PORT
           }));
           break;
           
@@ -111,7 +126,8 @@ wss.on('connection', (ws, req) => {
           // Respond to heartbeat
           ws.send(JSON.stringify({
             type: 'heartbeat_ack',
-            timestamp: Date.now()
+            timestamp: Date.now(),
+            port: PORT
           }));
           break;
           
@@ -175,4 +191,4 @@ process.on('SIGINT', () => {
   });
 });
 
-logger.info('Test WebSocket server is running. Press Ctrl+C to stop.'); 
+logger.info(`Test WebSocket server is running on port ${PORT}. Press Ctrl+C to stop.`); 

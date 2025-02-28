@@ -16,6 +16,7 @@ const logger = require('../utils/logger');
  * @param {string} options.language - Optional language filter
  * @param {number} options.limit - Maximum number of spaces to fetch
  * @returns {Promise<Array>} Array of Twitter Space objects
+ * @throws {Error} If no Twitter Spaces are found
  */
 async function discoverTwitterSpaces(options = {}) {
   const mode = options.mode || 'top';
@@ -28,13 +29,32 @@ async function discoverTwitterSpaces(options = {}) {
   let browser = null;
   
   try {
-    // Launch browser
+    // Launch browser with more robust settings
     browser = await chromium.launch({
-      headless: true
+      headless: true,
+      timeout: 60000,
+      args: [
+        '--disable-web-security',
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--disable-site-isolation-trials',
+        '--no-sandbox',
+        '--disable-setuid-sandbox'
+      ]
     });
     
-    const context = await browser.newContext();
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36',
+      viewport: { width: 1280, height: 800 },
+      timeout: 60000
+    });
+    
     const page = await context.newPage();
+    page.setDefaultTimeout(60000);
+    
+    // Add more logging
+    page.on('console', msg => {
+      logger.debug(`Browser console: ${msg.text()}`);
+    });
     
     // Construct URL with query parameters
     let url = `https://spacesdashboard.com/?lang=${language}&mode=${mode}`;
@@ -43,60 +63,116 @@ async function discoverTwitterSpaces(options = {}) {
     }
     
     logger.debug(`Navigating to: ${url}`);
-    await page.goto(url, { waitUntil: 'networkidle' });
     
-    // Wait for spaces to load
+    // Use more robust navigation
+    await page.goto(url, { 
+      waitUntil: 'domcontentloaded',
+      timeout: 60000 
+    });
+    
+    // Take a screenshot for debugging
+    await page.screenshot({ path: 'spaces-dashboard.png' });
+    logger.debug('Saved screenshot to spaces-dashboard.png');
+    
+    // Wait for spaces to load with a more reliable approach
     logger.debug('Waiting for spaces to load...');
-    await page.waitForSelector('.space-card', { timeout: 30000 });
+    
+    // First check if the page loaded at all
+    const pageTitle = await page.title();
+    logger.debug(`Page title: ${pageTitle}`);
+    
+    // Try different selectors that might indicate spaces
+    const possibleSelectors = [
+      '.space-card',
+      '.spaces-list',
+      '.space-item',
+      'a[href*="/i/spaces/"]',
+      'div[data-testid="spaces-card"]'
+    ];
+    
+    let spacesFound = false;
+    for (const selector of possibleSelectors) {
+      logger.debug(`Trying selector: ${selector}`);
+      const elements = await page.$$(selector);
+      if (elements.length > 0) {
+        logger.debug(`Found ${elements.length} elements with selector: ${selector}`);
+        spacesFound = true;
+        break;
+      }
+    }
+    
+    if (!spacesFound) {
+      logger.error('No spaces found on the page.');
+      throw new Error('No Twitter Spaces found on spacesdashboard.com');
+    }
     
     // Extract space information
     logger.debug('Extracting space information...');
     const spaces = await page.evaluate((maxSpaces) => {
-      const spaceCards = Array.from(document.querySelectorAll('.space-card'));
+      const spaceCards = Array.from(document.querySelectorAll('.space-card, a[href*="/i/spaces/"]'));
       return spaceCards.slice(0, maxSpaces).map(card => {
         // Extract space URL
-        const linkElement = card.querySelector('a[href*="/i/spaces/"]');
-        const spaceUrl = linkElement ? linkElement.href : null;
+        let spaceUrl = null;
+        if (card.tagName === 'A' && card.href && card.href.includes('/i/spaces/')) {
+          spaceUrl = card.href;
+        } else {
+          const linkElement = card.querySelector('a[href*="/i/spaces/"]');
+          spaceUrl = linkElement ? linkElement.href : null;
+        }
+        
+        // Skip if no valid URL found
+        if (!spaceUrl) return null;
         
         // Extract space ID from URL
-        const spaceId = spaceUrl ? spaceUrl.match(/\/i\/spaces\/([^?]+)/)?.[1] : null;
+        const spaceId = spaceUrl.match(/\/i\/spaces\/([^?]+)/)?.[1] || null;
         
         // Extract title
-        const titleElement = card.querySelector('.space-title');
-        const title = titleElement ? titleElement.textContent.trim() : 'Untitled Space';
+        const titleElement = card.querySelector('.space-title') || card.querySelector('h3, h4, .title');
+        const title = titleElement ? titleElement.textContent.trim() : '';
         
         // Extract host
-        const hostElement = card.querySelector('.space-host');
-        const host = hostElement ? hostElement.textContent.trim() : 'Unknown Host';
+        const hostElement = card.querySelector('.space-host') || card.querySelector('.host, .username');
+        const host = hostElement ? hostElement.textContent.trim() : '';
         
         // Extract listener count
-        const listenerElement = card.querySelector('.space-listeners');
+        const listenerElement = card.querySelector('.space-listeners') || card.querySelector('.listeners, .count');
         const listenersText = listenerElement ? listenerElement.textContent.trim() : '0';
         const listeners = parseInt(listenersText.replace(/[^0-9]/g, '')) || 0;
         
         // Extract status (live, scheduled, etc.)
-        const statusElement = card.querySelector('.space-status');
-        const status = statusElement ? statusElement.textContent.trim() : 'unknown';
+        const statusElement = card.querySelector('.space-status') || card.querySelector('.status, .state');
+        const status = statusElement ? statusElement.textContent.trim() : '';
         
         // Extract timestamp
-        const timeElement = card.querySelector('.space-time');
+        const timeElement = card.querySelector('.space-time') || card.querySelector('.time, .timestamp');
         const timestamp = timeElement ? timeElement.textContent.trim() : '';
         
         return {
           id: spaceId,
           url: spaceUrl,
-          title,
-          host,
+          title: title || 'Untitled Space',
+          host: host || 'Unknown Host',
           listeners,
           status,
           timestamp,
           discoveredAt: new Date().toISOString()
         };
-      });
+      }).filter(space => space !== null); // Filter out null entries
     }, limit);
     
     // Filter out spaces with missing URLs
-    const validSpaces = spaces.filter(space => space.url);
+    const validSpaces = spaces.filter(space => space.url && space.url.trim() !== '').map(space => {
+      // Convert x.com URLs to twitter.com URLs
+      if (space.url && space.url.includes('x.com/i/spaces/')) {
+        space.url = space.url.replace('x.com/i/spaces/', 'twitter.com/i/spaces/');
+      }
+      return space;
+    });
+    
+    if (validSpaces.length === 0) {
+      logger.error('No valid Twitter Spaces found with URLs.');
+      throw new Error('No valid Twitter Spaces found with URLs');
+    }
     
     logger.info(`Discovered ${validSpaces.length} Twitter Spaces`);
     
@@ -104,7 +180,7 @@ async function discoverTwitterSpaces(options = {}) {
   } catch (error) {
     logger.error(`Failed to discover Twitter Spaces: ${error.message}`);
     logger.debug(error.stack);
-    return [];
+    throw error; // Re-throw the error to fail fast
   } finally {
     if (browser) {
       await browser.close();
@@ -115,7 +191,8 @@ async function discoverTwitterSpaces(options = {}) {
 /**
  * Find the most popular Twitter Space based on listener count
  * @param {Object} options - Configuration options
- * @returns {Promise<Object|null>} Most popular Twitter Space or null if none found
+ * @returns {Promise<Object>} Most popular Twitter Space
+ * @throws {Error} If no Twitter Spaces are found
  */
 async function findMostPopularSpace(options = {}) {
   const spaces = await discoverTwitterSpaces({
@@ -124,15 +201,18 @@ async function findMostPopularSpace(options = {}) {
     limit: 20
   });
   
-  if (spaces.length === 0) {
-    logger.warn('No Twitter Spaces found');
-    return null;
+  if (!spaces || spaces.length === 0) {
+    throw new Error('No Twitter Spaces found');
   }
   
   // Sort by listener count (descending)
   spaces.sort((a, b) => b.listeners - a.listeners);
   
   const mostPopular = spaces[0];
+  if (!mostPopular) {
+    throw new Error('No valid Twitter Spaces found');
+  }
+  
   logger.info(`Most popular Twitter Space: "${mostPopular.title}" by ${mostPopular.host} (${mostPopular.listeners} listeners)`);
   
   return mostPopular;

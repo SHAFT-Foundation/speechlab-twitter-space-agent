@@ -5,81 +5,149 @@ const path = require('path');
 const AudioRecorder = require('node-audiorecorder');
 
 /**
- * Setup audio capture from the browser
- * @param {Page} page - Playwright page with active Twitter Space
- * @returns {Object} Audio capture configuration
+ * Setup audio capture from a Twitter Space
+ * @param {Object} page - Playwright page with active Twitter Space
+ * @returns {Promise<Object>} Audio capture object
  */
 async function setupAudioCapture(page) {
   logger.info('Setting up audio capture...');
   
   try {
-    // For a hackathon solution, we'll use system audio recording
-    // In a production environment, we might use:
-    // 1. Browser extension to capture audio
-    // 2. Virtual audio cable
-    // 3. Chrome Remote Debugging Protocol to access audio stream
+    // Wait for audio to be available
+    logger.info('Waiting for audio to be available...');
+    await page.waitForTimeout(5000);
     
-    const audioFormat = process.env.AUDIO_FORMAT || 'wav';
-    const audioQuality = process.env.AUDIO_QUALITY || 'medium';
+    // Check if we can access the audio context
+    const audioContextAvailable = await page.evaluate(() => {
+      return typeof AudioContext !== 'undefined' || typeof webkitAudioContext !== 'undefined';
+    });
     
-    logger.debug(`Audio format: ${audioFormat}, quality: ${audioQuality}`);
-    
-    // Ensure output directory exists
-    const outputDir = path.join(process.cwd(), 'recordings');
-    if (!fs.existsSync(outputDir)) {
-      fs.mkdirSync(outputDir);
+    if (!audioContextAvailable) {
+      throw new Error('AudioContext not available in the browser');
     }
     
-    // Create unique filename
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const outputFile = path.join(outputDir, `twitter-space-${timestamp}.${audioFormat}`);
+    // Create audio capture in the page context
+    logger.info('Creating audio capture in page context...');
+    const audioCaptureObj = await page.evaluate(() => {
+      // Use a unique ID for this capture session
+      const captureId = 'capture_' + Date.now();
+      
+      // Create audio context
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+      const audioContext = new AudioContext({ sampleRate: 48000 });
+      
+      // Create audio destination for capturing
+      const destination = audioContext.createMediaStreamDestination();
+      
+      // Create analyzer for monitoring audio levels
+      const analyzer = audioContext.createAnalyser();
+      analyzer.fftSize = 2048;
+      analyzer.smoothingTimeConstant = 0.8;
+      
+      // Connect analyzer to destination
+      analyzer.connect(destination);
+      
+      // Find and connect to audio elements
+      const audioElements = Array.from(document.querySelectorAll('audio'));
+      const videoElements = Array.from(document.querySelectorAll('video'));
+      const mediaElements = [...audioElements, ...videoElements];
+      
+      console.log(`Found ${mediaElements.length} media elements`);
+      
+      if (mediaElements.length === 0) {
+        console.warn('No audio or video elements found on the page');
+      }
+      
+      // Connect each media element to our audio graph
+      const mediaElementSources = mediaElements.map(element => {
+        try {
+          // Create media element source
+          const source = audioContext.createMediaElementSource(element);
+          
+          // Connect to both the analyzer (for capture) and the default destination (for local playback)
+          source.connect(analyzer);
+          source.connect(audioContext.destination);
+          
+          return source;
+        } catch (error) {
+          console.error(`Error connecting media element: ${error.message}`);
+          return null;
+        }
+      }).filter(source => source !== null);
+      
+      console.log(`Connected ${mediaElementSources.length} media element sources`);
+      
+      // Setup audio processing
+      const scriptProcessor = audioContext.createScriptProcessor(4096, 2, 2);
+      scriptProcessor.connect(audioContext.destination);
+      
+      // Store audio chunks
+      const audioChunks = [];
+      let isRecording = false;
+      
+      // Return the capture interface
+      return {
+        id: captureId,
+        start: () => {
+          isRecording = true;
+          console.log('Audio recording started');
+          return true;
+        },
+        stop: () => {
+          isRecording = false;
+          console.log('Audio recording stopped');
+          return true;
+        },
+        isRecording: () => isRecording,
+        getAudioContext: () => audioContext,
+        getDestination: () => destination,
+        getMediaStream: () => destination.stream,
+        getConnectedSources: () => mediaElementSources.length,
+        getAudioChunks: () => audioChunks,
+        clearAudioChunks: () => {
+          audioChunks.length = 0;
+          return true;
+        }
+      };
+    });
     
-    logger.debug(`Output file: ${outputFile}`);
-    
-    // Configure audio recorder options
-    const options = {
-      program: 'sox',       // Which program to use for recording
-      device: null,         // Recording device (null = system default)
-      bits: 16,             // Sample size
-      channels: 2,          // Number of channels
-      encoding: 'signed-integer',
-      format: audioFormat,  // Format of the output file
-      rate: 44100,          // Sample rate
-      type: 'wav',          // Format type
-      
-      // Following are only relevant for 'mp3' format
-      bitRate: 192,         // kbps
-      
-      // Silence settings
-      silence: 0,           // Length of silence before stop recording
-      
-      // Thresholds
-      thresholdStart: 0.1,  // Silence threshold to start recording
-      thresholdStop: 0.1,   // Silence threshold to stop recording
-      
-      // Miscellaneous
-      keepSilence: true,    // Keep silence in recording
-    };
-    
-    // Adjust quality based on settings
-    if (audioQuality === 'low') {
-      options.rate = 22050;
-      options.bitRate = 96;
-    } else if (audioQuality === 'high') {
-      options.rate = 48000;
-      options.bitRate = 320;
+    if (!audioCaptureObj) {
+      throw new Error('Failed to create audio capture');
     }
     
-    // Initialize audioRecorder
-    const audioRecorder = new AudioRecorder(options, logger);
+    // Create a temporary directory for recordings if it doesn't exist
+    const recordingsDir = path.join(__dirname, '../../recordings');
+    if (!fs.existsSync(recordingsDir)) {
+      fs.mkdirSync(recordingsDir, { recursive: true });
+    }
     
-    return {
-      recorder: audioRecorder,
-      outputFile: outputFile,
-      format: audioFormat,
-      quality: audioQuality,
-      page: page
+    // Create output file path
+    const outputFile = path.join(recordingsDir, `twitter-space-${Date.now()}.wav`);
+    
+    // Create audio recorder
+    const recorder = new AudioRecorder({
+      program: 'sox',
+      device: null,
+      bits: 16,
+      channels: 2,
+      rate: 48000,
+      type: 'wav'
+    });
+    
+    // Create the complete audio capture object
+    const audioCapture = {
+      ...audioCaptureObj,
+      page,
+      recorder,
+      outputFile,
+      isHeadless: process.env.BROWSER_HEADLESS === 'true'
     };
+    
+    logger.info('Audio capture setup successfully');
+    logger.debug(`Audio capture ID: ${audioCapture.id}`);
+    logger.debug(`Connected sources: ${audioCapture.getConnectedSources}`);
+    
+    return audioCapture;
   } catch (error) {
     logger.error(`Failed to setup audio capture: ${error.message}`);
     throw error;
@@ -96,7 +164,7 @@ async function startRecording(audioCapture, onData) {
   logger.info('Starting audio recording...');
   
   try {
-    const { recorder, outputFile, page } = audioCapture;
+    const { recorder, outputFile, page, isHeadless } = audioCapture;
     
     // Unmute the page if it's muted
     await page.evaluate(() => {
@@ -105,15 +173,46 @@ async function startRecording(audioCapture, onData) {
       if (muteButton) {
         const ariaLabel = muteButton.getAttribute('aria-label') || '';
         if (ariaLabel.includes('Unmute')) {
+          console.log('Unmuting Twitter Space audio...');
           muteButton.click();
         }
       }
       
-      // Set volume to maximum
+      // Set volume to maximum for all audio elements
       const audioElements = document.querySelectorAll('audio');
       audioElements.forEach(audio => {
         audio.volume = 1.0;
+        
+        // In headless mode, we need to ensure audio is playing
+        if (!audio.paused) {
+          console.log('Audio is already playing');
+        } else {
+          console.log('Attempting to play audio...');
+          const playPromise = audio.play();
+          if (playPromise) {
+            playPromise.catch(e => console.error('Error playing audio:', e));
+          }
+        }
+        
+        // Log audio element details for debugging
+        console.log('Audio element:', {
+          src: audio.src,
+          paused: audio.paused,
+          muted: audio.muted,
+          volume: audio.volume,
+          duration: audio.duration,
+          currentTime: audio.currentTime
+        });
       });
+      
+      return {
+        audioCount: document.querySelectorAll('audio').length,
+        videoCount: document.querySelectorAll('video').length
+      };
+    }).then(counts => {
+      logger.debug(`Found ${counts.audioCount} audio elements and ${counts.videoCount} video elements`);
+    }).catch(err => {
+      logger.warn(`Error while unmuting: ${err.message}`);
     });
     
     logger.debug('Audio unmuted, starting recorder...');

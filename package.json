@@ -9,20 +9,21 @@
   },
   "dependencies": {
     "@azure/arm-compute": "^17.3.1",
-    "@azure/identity": "^3.2.1",
     "@azure/arm-network": "^26.0.0",
     "@azure/arm-resources": "^4.2.2",
-    "playwright": "^1.32.0",
-    "ws": "^8.13.0",
-    "dotenv": "^16.0.3",
-    "winston": "^3.8.2",
+    "@azure/identity": "^3.2.1",
     "commander": "^10.0.0",
+    "dotenv": "^16.0.3",
+    "node-audiorecorder": "^3.0.0",
     "node-wav": "^0.0.2",
-    "node-audiorecorder": "^3.0.0"
+    "playwright": "^1.32.0",
+    "winston": "^3.8.2",
+    "ws": "^8.13.0",
+    "yargs": "^17.7.2"
   },
   "engines": {
     "node": ">=14.0.0"
   },
   "author": "",
   "license": "MIT"
-} 
+}
