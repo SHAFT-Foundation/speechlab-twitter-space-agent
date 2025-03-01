@@ -94,6 +94,54 @@ node multi-space-capture.js --count 5 --debug
 node multi-space-capture.js --urls "https://twitter.com/i/spaces/1dRJZYWDNVrGB,https://twitter.com/i/spaces/1YqKDqVNLAVKV" --websocket-urls "wss://example.com/audio1,wss://example.com/audio2"
 ```
 
+### Single Space Capture
+
+Capture audio from a specific Twitter Space or find a popular space:
+
+```bash
+node capture-space.js [options]
+```
+
+#### Options:
+- `-u, --url <url>`: Twitter Space URL to capture
+- `-d, --debug`: Enable debug logging
+- `-t, --test-mode`: Run in test mode (default: true)
+- `-w, --websocket <endpoint>`: WebSocket endpoint (default: wss://localryan.ngrok.app/meeting/wuw-vfud-cre/audio)
+- `--headless`: Run in headless mode (browser not visible) (default: true)
+- `--visible`: Run in visible mode (browser visible) (default: false)
+- `-p, --port <port>`: WebSocket server port (default: 8080)
+- `-l, --limit <limit>`: Limit of spaces to check when discovering (default: 5)
+
+#### Examples:
+
+```bash
+# Capture a specific Twitter Space
+node capture-space.js --url https://twitter.com/i/spaces/1dRJZYWDNVrGB
+
+# Find and capture a popular space with debug logging
+node capture-space.js --debug
+
+# Capture a space with a custom WebSocket endpoint
+node capture-space.js --url https://twitter.com/i/spaces/1dRJZYWDNVrGB --websocket wss://example.com/audio
+
+# Run with visible browser for debugging
+node capture-space.js --url https://twitter.com/i/spaces/1dRJZYWDNVrGB --visible
+```
+
+### Installation Verification
+
+Verify the installation and dependencies:
+
+```bash
+node test.js
+```
+
+This command runs a series of tests to verify:
+- Required environment variables are set
+- Playwright browser can be launched
+- WebSocket server can be started
+- Audio processing functionality works correctly
+
 ## Architecture
 
 The tool consists of several modules:
@@ -115,3 +163,20 @@ This is a hackathon implementation designed for quick results. Some consideratio
 ## License
 
 MIT
+
+### Setup Script
+
+Run the setup script to verify and install dependencies:
+
+```bash
+./setup.sh
+```
+
+This script:
+- Checks if Node.js 14.0.0 or higher is installed
+- Verifies npm is installed
+- Installs npm dependencies
+- Installs Playwright browsers
+- Checks if SOX is installed (required for audio capture)
+- Creates necessary directories
+- Verifies environment variables
