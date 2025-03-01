@@ -98,7 +98,6 @@ async function main() {
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--mute-audio', // Initially mute so we don't hear it locally
         '--autoplay-policy=no-user-gesture-required',
         '--use-fake-ui-for-media-stream',
         '--enable-audio-service'

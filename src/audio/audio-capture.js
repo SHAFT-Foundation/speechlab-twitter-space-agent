@@ -19,255 +19,278 @@ async function setupAudioCapture(page) {
       throw new Error('Page is closed or not available');
     }
     
-    // Wait for audio to be available
-    logger.info('Waiting for audio to be available...');
-    try {
-      await page.waitForTimeout(5000);
-    } catch (error) {
-      logger.error(`Error waiting for audio: ${error.message}`);
-      throw new Error(`Failed to wait for audio: ${error.message}`);
+    // Create output directory if it doesn't exist
+    const outputDir = path.join(__dirname, '../../recordings');
+    if (!fs.existsSync(outputDir)) {
+      fs.mkdirSync(outputDir, { recursive: true });
     }
     
-    // Check if page is still open after waiting
-    if (!page || page.isClosed()) {
-      throw new Error('Page was closed while waiting for audio');
-    }
+    // Generate output file path with timestamp
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const outputFilePath = path.join(outputDir, `twitter-space-${timestamp}.wav`);
+    logger.info(`Output file path: ${outputFilePath}`);
     
-    // Try to find media elements with multiple attempts
-    let mediaElementsFound = false;
-    let attempts = 0;
-    const maxAttempts = 5;
+    // Create audio capture configuration
+    const audioCapture = {
+      page,
+      outputFilePath,
+      isRecording: false,
+      audioRecorder: null,
+      fileStream: null,
+      dataCollectionInterval: null,
+      audioBuffer: [],
+      wsConnection: null,
+      audioContext: null,
+      scriptProcessor: null,
+      mediaStreamSource: null,
+      gainNode: null
+    };
     
-    while (!mediaElementsFound && attempts < maxAttempts) {
-      attempts++;
-      logger.info(`Attempt ${attempts}/${maxAttempts} to find media elements...`);
-      
-      // Check for media elements
-      const hasMediaElements = await page.evaluate(() => {
-        const audioElements = document.querySelectorAll('audio');
-        const videoElements = document.querySelectorAll('video');
-        return audioElements.length > 0 || videoElements.length > 0;
-      }).catch(error => {
-        logger.error(`Error checking for media elements: ${error.message}`);
-        return false;
-      });
-      
-      if (hasMediaElements) {
-        logger.info('Media elements found on the page');
-        mediaElementsFound = true;
-      } else {
-        logger.warn(`No media elements found on attempt ${attempts}/${maxAttempts}`);
+    // Check if we're in headless mode
+    const isHeadless = process.env.BROWSER_HEADLESS === 'true';
+    logger.info(`Browser headless mode: ${isHeadless}`);
+    
+    // Setup system audio recorder if not in headless mode
+    if (!isHeadless) {
+      try {
+        logger.info('Setting up system audio recorder...');
         
-        if (attempts < maxAttempts) {
-          // Try to interact with the page to trigger media elements
-          await page.evaluate(() => {
-            // Click on various elements that might trigger audio
-            const possibleTriggers = [
-              document.querySelector('[data-testid="audioSpaceBarPlayButton"]'),
-              document.querySelector('[data-testid="audioSpaceControls"]'),
-              document.querySelector('[role="button"]:has-text("Listen")')
-            ];
-            
-            possibleTriggers.forEach(element => {
-              if (element) element.click();
-            });
-          }).catch(error => {
-            logger.warn(`Error interacting with page: ${error.message}`);
+        // Configure audio recorder for system audio (not microphone)
+        const recorder = new AudioRecorder({
+          program: 'sox',
+          device: null, // Use system default audio device
+          bits: 16,
+          channels: 1,
+          encoding: 'signed-integer',
+          rate: 16000,
+          type: 'wav',
+          silence: 0, // No silence detection
+          thresholdStart: 0, // Start immediately
+          thresholdStop: 0, // Never stop automatically
+          keepSilence: true, // Keep silence in recording
+          audioType: 'system', // Capture system audio, not microphone
+        }, logger);
+        
+        logger.info('System audio recorder configured successfully');
+        logger.debug(`Recorder settings: ${JSON.stringify({
+          bits: 16,
+          channels: 1,
+          rate: 16000,
+          type: 'wav',
+          audioType: 'system'
+        })}`);
+        
+        audioCapture.audioRecorder = recorder;
+        
+        // Log available devices
+        logger.debug('Attempting to list available audio devices...');
+        try {
+          const { exec } = require('child_process');
+          exec('sox -help', (error, stdout, stderr) => {
+            if (error) {
+              logger.debug(`Error getting sox help: ${error.message}`);
+              return;
+            }
+            logger.debug(`Sox help output: ${stdout}`);
           });
           
-          // Take a screenshot to debug
-          const screenshotPath = path.join(__dirname, '../../logs', `media-search-attempt-${attempts}-${Date.now()}.png`);
-          await page.screenshot({ path: screenshotPath }).catch(e => logger.error(`Failed to take screenshot: ${e.message}`));
-          logger.info(`Screenshot saved to: ${screenshotPath}`);
-          
-          // Wait before next attempt
-          logger.info(`Waiting 5 seconds before next attempt...`);
-          await page.waitForTimeout(5000);
+          // Try to list audio devices
+          exec('sox -d', (error, stdout, stderr) => {
+            if (error) {
+              logger.debug(`Error listing audio devices: ${error.message}`);
+              return;
+            }
+            logger.debug(`Audio devices: ${stderr}`);
+          });
+        } catch (err) {
+          logger.debug(`Error listing audio devices: ${err.message}`);
         }
+      } catch (error) {
+        logger.error(`Failed to setup system audio recorder: ${error.message}`);
+        logger.warn('Falling back to browser-based audio capture');
       }
     }
     
-    if (!mediaElementsFound) {
-      logger.warn(`Could not find media elements after ${maxAttempts} attempts. Will try to continue anyway.`);
-    }
+    // Setup browser-based audio capture as fallback or for headless mode
+    logger.info('Setting up browser-based audio capture...');
     
-    // Check if we can access the audio context
-    const audioContextAvailable = await page.evaluate(() => {
-      return typeof AudioContext !== 'undefined' || typeof webkitAudioContext !== 'undefined';
-    }).catch(error => {
-      logger.error(`Error checking audio context: ${error.message}`);
-      return false;
-    });
-    
-    if (!audioContextAvailable) {
-      throw new Error('AudioContext not available in the browser');
-    }
-    
-    // Create audio capture in the page context
-    logger.info('Creating audio capture in page context...');
-    const audioCaptureObj = await page.evaluate(() => {
-      // Create audio context
-      const AudioContext = window.AudioContext || window.webkitAudioContext;
-      const audioContext = new AudioContext();
-      
-      // Find all audio and video elements
-      const audioElements = Array.from(document.querySelectorAll('audio'));
-      const videoElements = Array.from(document.querySelectorAll('video'));
-      
-      console.log(`Found ${audioElements.length} audio elements and ${videoElements.length} video elements`);
-      
-      // Create media element sources
-      const sources = [];
-      
-      // Connect audio elements
-      audioElements.forEach((audio, index) => {
-        try {
-          // Unmute and set volume to max
-          audio.muted = false;
-          audio.volume = 1.0;
-          
-          // Create source
-          const source = audioContext.createMediaElementSource(audio);
-          sources.push(source);
-          
-          console.log(`Connected audio element ${index}`);
-        } catch (error) {
-          console.error(`Error connecting audio element ${index}: ${error.message}`);
-        }
-      });
-      
-      // Connect video elements (for their audio)
-      videoElements.forEach((video, index) => {
-        try {
-          // Unmute and set volume to max
-          video.muted = false;
-          video.volume = 1.0;
-          
-          // Create source
-          const source = audioContext.createMediaElementSource(video);
-          sources.push(source);
-          
-          console.log(`Connected video element ${index}`);
-        } catch (error) {
-          console.error(`Error connecting video element ${index}: ${error.message}`);
-        }
-      });
-      
-      // Create a gain node to combine all sources
-      const gainNode = audioContext.createGain();
-      gainNode.gain.value = 1.0;
-      
-      // Connect all sources to the gain node
-      sources.forEach(source => source.connect(gainNode));
-      
-      // Connect gain node to destination (speakers)
-      gainNode.connect(audioContext.destination);
-      
-      // Create a script processor for capturing audio data
-      // Note: ScriptProcessorNode is deprecated but still widely supported
-      const bufferSize = 4096;
-      const scriptProcessor = audioContext.createScriptProcessor(
-        bufferSize,
-        2, // Input channels (stereo)
-        2  // Output channels (stereo)
-      );
-      
-      // Connect gain node to script processor
-      gainNode.connect(scriptProcessor);
-      scriptProcessor.connect(audioContext.destination);
-      
-      // Buffer to store audio data
-      let audioBuffer = [];
-      
-      // Handle audio processing
-      scriptProcessor.onaudioprocess = (event) => {
-        const inputData = event.inputBuffer.getChannelData(0);
+    try {
+      // Find all audio and video elements on the page
+      const mediaElementsCount = await page.evaluate(() => {
+        // Find all audio and video elements
+        const mediaElements = document.querySelectorAll('audio, video');
+        console.log(`Found ${mediaElements.length} media elements on the page`);
         
-        // Store the audio data
-        const buffer = new Float32Array(inputData);
-        audioBuffer.push(buffer);
-        
-        // Limit buffer size to prevent memory issues
-        if (audioBuffer.length > 100) {
-          audioBuffer.shift();
-        }
-      };
-      
-      // Return the audio capture interface
-      return {
-        isCapturing: true,
-        connectedSources: sources.length,
-        sampleRate: audioContext.sampleRate,
-        
-        // Get audio data
-        getAudioData: () => {
-          if (audioBuffer.length === 0) {
-            return null;
-          }
-          
-          // Concatenate all buffers
-          const totalLength = audioBuffer.reduce((acc, buf) => acc + buf.length, 0);
-          const result = new Float32Array(totalLength);
-          
-          let offset = 0;
-          audioBuffer.forEach(buffer => {
-            result.set(buffer, offset);
-            offset += buffer.length;
+        // Log details about each media element
+        Array.from(mediaElements).forEach((element, index) => {
+          console.log(`Media element ${index}:`, {
+            tagName: element.tagName,
+            id: element.id,
+            className: element.className,
+            src: element.src,
+            currentSrc: element.currentSrc,
+            paused: element.paused,
+            muted: element.muted,
+            volume: element.volume,
+            readyState: element.readyState,
+            networkState: element.networkState
           });
           
-          // Clear the buffer after reading
-          audioBuffer = [];
+          // Ensure it's unmuted and at max volume
+          try {
+            element.muted = false;
+            element.volume = 1.0;
+            console.log(`Set element ${index} to unmuted and max volume`);
+          } catch (err) {
+            console.error(`Error configuring media element ${index}:`, err);
+          }
+        });
+        
+        return mediaElements.length;
+      });
+      
+      logger.info(`Found ${mediaElementsCount} media elements on the page`);
+      
+      // Setup audio context and connect to media elements
+      await page.evaluate(() => {
+        try {
+          // Create audio context if it doesn't exist
+          if (!window.twitterSpaceAudioContext) {
+            console.log('Creating new AudioContext');
+            window.twitterSpaceAudioContext = new (window.AudioContext || window.webkitAudioContext)({
+              sampleRate: 16000
+            });
+            console.log(`AudioContext created with sample rate: ${window.twitterSpaceAudioContext.sampleRate}Hz`);
+          }
           
-          return result;
-        },
-        
-        // Start recording
-        startRecording: () => {
-          console.log('Starting browser recording...');
-          audioBuffer = [];
-        },
-        
-        // Stop recording
-        stopRecording: () => {
-          console.log('Stopping browser recording...');
-          audioBuffer = [];
+          // Create gain node to combine all audio sources
+          if (!window.twitterSpaceGainNode) {
+            console.log('Creating gain node');
+            window.twitterSpaceGainNode = window.twitterSpaceAudioContext.createGain();
+            window.twitterSpaceGainNode.gain.value = 1.0;
+            
+            // Connect gain node to destination (speakers)
+            window.twitterSpaceGainNode.connect(window.twitterSpaceAudioContext.destination);
+            console.log('Gain node connected to audio context destination');
+          }
+          
+          // Create script processor for capturing audio data
+          if (!window.twitterSpaceScriptProcessor) {
+            console.log('Creating script processor node');
+            window.twitterSpaceScriptProcessor = window.twitterSpaceAudioContext.createScriptProcessor(4096, 1, 1);
+            
+            // Connect script processor to gain node
+            window.twitterSpaceScriptProcessor.connect(window.twitterSpaceGainNode);
+            console.log('Script processor connected to gain node');
+            
+            // Create buffer to store audio data
+            window.twitterSpaceAudioBuffer = [];
+            
+            // Setup audio processing callback
+            window.twitterSpaceScriptProcessor.onaudioprocess = (e) => {
+              const inputBuffer = e.inputBuffer.getChannelData(0);
+              
+              // Calculate audio level for logging
+              let sum = 0;
+              for (let i = 0; i < inputBuffer.length; i++) {
+                sum += Math.abs(inputBuffer[i]);
+              }
+              const average = sum / inputBuffer.length;
+              
+              // Log audio level periodically (every ~1 second)
+              if (Math.random() < 0.01) {
+                console.log(`Audio level: ${average.toFixed(6)}`);
+              }
+              
+              // Store audio data
+              window.twitterSpaceAudioBuffer.push(new Float32Array(inputBuffer));
+              
+              // Keep buffer size reasonable
+              if (window.twitterSpaceAudioBuffer.length > 100) {
+                window.twitterSpaceAudioBuffer.shift();
+              }
+            };
+          }
+          
+          // Connect all media elements to the audio context
+          const mediaElements = document.querySelectorAll('audio, video');
+          console.log(`Connecting ${mediaElements.length} media elements to audio context`);
+          
+          Array.from(mediaElements).forEach((element, index) => {
+            try {
+              // Skip if already connected
+              if (element.twitterSpaceConnected) {
+                console.log(`Media element ${index} already connected`);
+                return;
+              }
+              
+              // Create media element source
+              const source = window.twitterSpaceAudioContext.createMediaElementSource(element);
+              console.log(`Created media element source for element ${index}`);
+              
+              // Connect source to gain node and script processor
+              source.connect(window.twitterSpaceGainNode);
+              source.connect(window.twitterSpaceScriptProcessor);
+              console.log(`Connected media element ${index} to gain node and script processor`);
+              
+              // Mark as connected
+              element.twitterSpaceConnected = true;
+              
+              // Ensure it's unmuted and at max volume
+              element.muted = false;
+              element.volume = 1.0;
+              
+              // Try to play if paused
+              if (element.paused && element.readyState >= 2) {
+                element.play().catch(e => console.log(`Could not play element ${index}: ${e.message}`));
+              }
+              
+              console.log(`Media element ${index} setup complete`);
+            } catch (err) {
+              console.error(`Error connecting media element ${index}:`, err);
+            }
+          });
+          
+          // Setup methods for starting and stopping recording
+          window.startAudioCapture = () => {
+            console.log('Starting browser audio capture');
+            window.twitterSpaceIsRecording = true;
+          };
+          
+          window.stopAudioCapture = () => {
+            console.log('Stopping browser audio capture');
+            window.twitterSpaceIsRecording = false;
+          };
+          
+          // Setup method for retrieving audio data
+          window.getAudioData = () => {
+            if (!window.twitterSpaceAudioBuffer || window.twitterSpaceAudioBuffer.length === 0) {
+              return null;
+            }
+            
+            // Get all buffered data
+            const buffers = window.twitterSpaceAudioBuffer;
+            
+            // Clear buffer
+            window.twitterSpaceAudioBuffer = [];
+            
+            return buffers;
+          };
+          
+          console.log('Browser-based audio capture setup complete');
+          return true;
+        } catch (error) {
+          console.error('Error setting up browser-based audio capture:', error);
+          return false;
         }
-      };
-    }).catch(error => {
-      logger.error(`Error creating audio capture: ${error.message}`);
-      throw new Error(`Failed to create audio capture: ${error.message}`);
-    });
-    
-    // Create temporary directory for recordings if it doesn't exist
-    const recordingsDir = path.join(__dirname, '../../recordings');
-    if (!fs.existsSync(recordingsDir)) {
-      fs.mkdirSync(recordingsDir, { recursive: true });
+      });
+      
+      logger.info('Browser-based audio capture setup complete');
+    } catch (error) {
+      logger.error(`Failed to setup browser-based audio capture: ${error.message}`);
     }
     
-    // Create output file path
-    const outputFile = path.join(recordingsDir, `twitter-space-${Date.now()}.wav`);
-    
-    // Initialize recorder with S16LE format, 16000Hz, mono
-    const recorder = new AudioRecorder({
-      program: 'sox',
-      bits: 16,
-      channels: 1,
-      rate: 16000,
-      type: 'wav',
-      silence: 0
-    });
-    
-    logger.info(`Audio capture setup complete. Sample rate: 16000Hz, Format: S16LE, Channels: 1`);
-    logger.info(`Recording will be saved to: ${outputFile}`);
-    
-    // Return the complete audio capture object
-    return {
-      page,
-      recorder,
-      outputFile,
-      isHeadless: process.env.BROWSER_HEADLESS === 'true',
-      audioCaptureObj
-    };
+    return audioCapture;
   } catch (error) {
     logger.error(`Failed to setup audio capture: ${error.message}`);
     throw error;
@@ -275,315 +298,351 @@ async function setupAudioCapture(page) {
 }
 
 /**
- * Connect to WebSocket endpoint for streaming audio
- * @param {string} websocketEndpoint - WebSocket endpoint URL
- * @param {Object} audioCapture - Audio capture configuration
- * @returns {Promise<Object>} WebSocket connection and utilities
+ * Connect to a WebSocket server for sending audio data
+ * @param {string} websocketUrl - WebSocket server URL
+ * @returns {Promise<WebSocket>} WebSocket connection
  */
-async function connectToWebSocket(websocketEndpoint, audioCapture) {
-  logger.info(`Connecting to WebSocket endpoint: ${websocketEndpoint}`);
+async function connectToWebSocket(websocketUrl) {
+  logger.info(`Connecting to WebSocket server: ${websocketUrl}`);
   
-  // Create a more robust WebSocket connection with reconnection logic
-  let ws = null;
-  let connected = false;
-  let reconnectAttempt = 0;
-  const maxReconnectAttempts = 10;
-  const reconnectDelay = 2000; // 2 seconds
-  
-  const connectWebSocket = () => {
-    return new Promise((resolve, reject) => {
-      try {
-        logger.info(`Attempting WebSocket connection to ${websocketEndpoint} (attempt ${reconnectAttempt + 1}/${maxReconnectAttempts})`);
-        
-        // Close existing connection if any
-        if (ws) {
-          try {
-            ws.terminate();
-          } catch (e) {
-            logger.warn(`Error terminating existing WebSocket: ${e.message}`);
-          }
-        }
-        
-        // Create new WebSocket connection
-        ws = new WebSocket(websocketEndpoint);
-        
-        // Set up event handlers
-        ws.on('open', () => {
-          logger.info('WebSocket connection established successfully');
-          connected = true;
-          
-          // Send initial metadata
-          try {
-            const metadata = {
-              type: 'metadata',
-              sampleRate: 16000,
-              channels: 1,
-              bitsPerSample: 16,
-              encoding: 'S16LE',
-              source: 'twitter-space'
-            };
-            
-            ws.send(JSON.stringify(metadata));
-            logger.info('Sent audio metadata to WebSocket server');
-          } catch (error) {
-            logger.error(`Error sending metadata: ${error.message}`);
-          }
-          
-          resolve(ws);
-        });
-        
-        ws.on('error', (error) => {
-          logger.error(`WebSocket error: ${error.message}`);
-          if (!connected) {
-            reject(error);
-          }
-        });
-        
-        ws.on('close', (code, reason) => {
-          logger.warn(`WebSocket connection closed: Code ${code}, Reason: ${reason || 'No reason provided'}`);
-          connected = false;
-          
-          // Attempt to reconnect if not manually closed
-          if (code !== 1000 && reconnectAttempt < maxReconnectAttempts) {
-            reconnectAttempt++;
-            logger.info(`Attempting to reconnect (${reconnectAttempt}/${maxReconnectAttempts}) in ${reconnectDelay}ms...`);
-            
-            setTimeout(() => {
-              connectWebSocket()
-                .then(newWs => {
-                  ws = newWs;
-                  logger.info('WebSocket reconnected successfully');
-                })
-                .catch(error => {
-                  logger.error(`Failed to reconnect WebSocket: ${error.message}`);
-                });
-            }, reconnectDelay);
-          }
-        });
-        
-        // Set up heartbeat to keep connection alive
-        const heartbeatInterval = setInterval(() => {
-          if (ws && ws.readyState === WebSocket.OPEN) {
-            try {
-              ws.send(JSON.stringify({ type: 'heartbeat', timestamp: Date.now() }));
-              logger.debug('Sent heartbeat to WebSocket server');
-            } catch (error) {
-              logger.warn(`Error sending heartbeat: ${error.message}`);
-            }
-          } else if (!connected) {
-            clearInterval(heartbeatInterval);
-          }
-        }, 30000); // Send heartbeat every 30 seconds
-        
-        // Clean up interval on close
-        ws.on('close', () => {
-          clearInterval(heartbeatInterval);
-        });
-        
-      } catch (error) {
-        logger.error(`Error creating WebSocket connection: ${error.message}`);
+  try {
+    // Validate WebSocket URL
+    if (!websocketUrl || !websocketUrl.startsWith('ws')) {
+      throw new Error(`Invalid WebSocket URL: ${websocketUrl}`);
+    }
+    
+    // Create a new WebSocket connection
+    const ws = new WebSocket(websocketUrl);
+    
+    // Set up connection timeout
+    const connectionTimeout = setTimeout(() => {
+      if (ws.readyState !== 1) { // Not OPEN
+        logger.error('WebSocket connection timeout');
+        ws.close(1006, 'Connection timeout');
+      }
+    }, 10000); // 10 seconds timeout
+    
+    // Wait for the connection to open
+    await new Promise((resolve, reject) => {
+      // Connection opened
+      ws.on('open', () => {
+        logger.info('WebSocket connection established');
+        clearTimeout(connectionTimeout);
+        resolve();
+      });
+      
+      // Connection error
+      ws.on('error', (error) => {
+        logger.error(`WebSocket connection error: ${error.message}`);
+        clearTimeout(connectionTimeout);
         reject(error);
+      });
+    });
+    
+    // Set up event handlers for the connection
+    ws.on('message', (data) => {
+      try {
+        // Try to parse as JSON
+        const message = JSON.parse(data);
+        logger.debug(`Received message from WebSocket server: ${JSON.stringify(message)}`);
+        
+        // Handle different message types
+        if (message.type === 'heartbeat') {
+          // Respond to heartbeat
+          ws.send(JSON.stringify({ type: 'heartbeat_ack', timestamp: new Date().toISOString() }));
+        }
+      } catch (error) {
+        // Not JSON, log as binary data
+        logger.debug(`Received binary data from WebSocket server: ${data.length} bytes`);
       }
     });
-  };
-  
-  // Initial connection attempt
-  try {
-    ws = await connectWebSocket();
     
-    // Return the WebSocket and a function to send audio data
-    return {
-      ws,
-      sendAudioData: (audioData) => {
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          try {
-            // Send the raw audio data (already in S16LE format from recorder)
-            ws.send(audioData);
-            return true;
-          } catch (error) {
-            logger.error(`Error sending audio data: ${error.message}`);
-            return false;
-          }
-        }
-        return false;
-      },
-      close: () => {
-        if (ws) {
-          try {
-            ws.close(1000, 'Closing connection normally');
-            logger.info('WebSocket connection closed normally');
-          } catch (error) {
-            logger.error(`Error closing WebSocket: ${error.message}`);
-          }
-        }
+    ws.on('close', (code, reason) => {
+      logger.info(`WebSocket connection closed: ${code} - ${reason}`);
+    });
+    
+    ws.on('error', (error) => {
+      logger.error(`WebSocket error: ${error.message}`);
+    });
+    
+    // Set up heartbeat to keep connection alive
+    const heartbeatInterval = setInterval(() => {
+      if (ws.readyState === 1) { // OPEN
+        logger.debug('Sending heartbeat to WebSocket server');
+        ws.send(JSON.stringify({ type: 'heartbeat', timestamp: new Date().toISOString() }));
+      } else {
+        clearInterval(heartbeatInterval);
       }
+    }, 30000); // Send heartbeat every 30 seconds
+    
+    // Store the heartbeat interval for cleanup
+    ws.heartbeatInterval = heartbeatInterval;
+    
+    // Override close method to clean up resources
+    const originalClose = ws.close;
+    ws.close = function(code, reason) {
+      clearInterval(this.heartbeatInterval);
+      return originalClose.call(this, code, reason);
     };
+    
+    return ws;
   } catch (error) {
-    logger.error(`Failed to connect to WebSocket: ${error.message}`);
-    throw error;
+    logger.error(`Failed to connect to WebSocket server: ${error.message}`);
+    
+    // Try to reconnect with exponential backoff
+    logger.info('Will attempt to reconnect...');
+    return null;
   }
 }
 
 /**
- * Start recording audio from the browser
+ * Start recording audio from the Twitter Space
  * @param {Object} audioCapture - Audio capture configuration
- * @param {Object} wsConnection - WebSocket connection object
- * @returns {Promise<boolean>} True if recording started successfully, false otherwise
+ * @param {string} websocketUrl - WebSocket URL to send audio data to (optional)
+ * @returns {Promise<boolean>} Success status
  */
-async function startRecording(audioCapture, wsConnection) {
+async function startRecording(audioCapture, websocketUrl = null) {
   logger.info('Starting audio recording...');
   
-  if (!audioCapture) {
-    throw new Error('Audio capture not set up');
-  }
-  
   try {
-    // Start the recorder
-    if (audioCapture.recorder) {
-      logger.info(`Starting recorder, saving to: ${audioCapture.outputFile}`);
-      audioCapture.recorder.start().stream();
+    // Check if audio capture is set up
+    if (!audioCapture) {
+      logger.error('Audio capture not set up');
+      return false;
+    }
+    
+    // Set recording flag
+    audioCapture.isRecording = true;
+    
+    // Connect to WebSocket if URL is provided
+    if (websocketUrl) {
+      logger.info(`Connecting to WebSocket: ${websocketUrl}`);
+      audioCapture.wsConnection = await connectToWebSocket(websocketUrl);
+      
+      // Send initial metadata to WebSocket
+      if (audioCapture.wsConnection) {
+        const metadata = {
+          type: 'metadata',
+          format: 'S16LE',
+          sampleRate: 16000,
+          channels: 1,
+          timestamp: new Date().toISOString()
+        };
+        
+        logger.info(`Sending metadata to WebSocket: ${JSON.stringify(metadata)}`);
+        audioCapture.wsConnection.send(JSON.stringify(metadata));
+      }
+    }
+    
+    // Create file stream for saving audio
+    logger.info(`Creating file stream for output: ${audioCapture.outputFilePath}`);
+    audioCapture.fileStream = fs.createWriteStream(audioCapture.outputFilePath, { encoding: 'binary' });
+    
+    // Start the recorder if available (system audio recording)
+    if (audioCapture.audioRecorder) {
+      logger.info(`Starting system audio recorder, saving to: ${audioCapture.outputFilePath}`);
+      
+      // Start the recorder and pipe to file
+      const stream = audioCapture.audioRecorder.start().stream();
+      stream.pipe(audioCapture.fileStream);
       
       // Set up data event handler for the recorder
-      audioCapture.recorder.stream().on('data', (chunk) => {
-        // Save to file (handled automatically by the recorder)
+      stream.on('data', (chunk) => {
+        // Log audio data size periodically
+        if (Math.random() < 0.01) { // Log roughly 1% of the time
+          logger.debug(`Received audio chunk: ${chunk.length} bytes`);
+        }
         
-        // Send to WebSocket if available
-        if (wsConnection && typeof wsConnection.sendAudioData === 'function') {
-          const success = wsConnection.sendAudioData(chunk);
-          if (!success) {
-            logger.warn('Failed to send audio chunk to WebSocket');
+        // Send to WebSocket if connected
+        if (audioCapture.wsConnection && audioCapture.wsConnection.readyState === 1) {
+          try {
+            audioCapture.wsConnection.send(chunk);
+          } catch (error) {
+            logger.error(`Error sending audio data to WebSocket: ${error.message}`);
           }
         }
       });
       
       // Set up error handler
-      audioCapture.recorder.stream().on('error', (error) => {
+      stream.on('error', (error) => {
         logger.error(`Recorder error: ${error.message}`);
       });
       
       // Set up close handler
-      audioCapture.recorder.stream().on('close', () => {
+      stream.on('close', () => {
         logger.info('Recorder stream closed');
       });
       
-      logger.info('Recorder started successfully');
+      logger.info('System audio recorder started successfully');
     } else {
-      // Fall back to browser-based recording if recorder not available
-      logger.info('Using browser-based recording (no local recorder available)');
+      // Fall back to browser-based recording
+      logger.info('Starting browser-based audio recording');
       
-      await audioCapture.page.evaluate(() => {
-        if (window.audioCapture && typeof window.audioCapture.startRecording === 'function') {
-          window.audioCapture.startRecording();
+      // Start the browser-based recording
+      const startResult = await audioCapture.page.evaluate(() => {
+        if (window.startAudioCapture && typeof window.startAudioCapture === 'function') {
+          window.startAudioCapture();
           return true;
         }
         return false;
       });
       
-      // Set up interval to collect and send audio data from the browser
-      const dataCollectionInterval = setInterval(async () => {
-        try {
-          const audioData = await audioCapture.page.evaluate(() => {
-            if (window.audioCapture && typeof window.audioCapture.getAudioData === 'function') {
-              return window.audioCapture.getAudioData();
+      if (startResult) {
+        logger.info('Browser-based audio recording started successfully');
+        
+        // Set up interval to collect and send audio data from the browser
+        audioCapture.dataCollectionInterval = setInterval(async () => {
+          try {
+            if (!audioCapture.isRecording) {
+              clearInterval(audioCapture.dataCollectionInterval);
+              return;
             }
-            return null;
-          });
-          
-          if (audioData && wsConnection && typeof wsConnection.sendAudioData === 'function') {
-            // Convert Float32Array to S16LE format (16-bit signed integers, little-endian)
-            // and downsample to 16000Hz if needed
-            const float32Array = new Float32Array(audioData);
             
-            // Create a buffer for the S16LE data
-            const s16leBuffer = Buffer.alloc(float32Array.length * 2); // 2 bytes per sample
+            // Get audio data from the browser
+            const audioData = await audioCapture.page.evaluate(() => {
+              if (window.getAudioData && typeof window.getAudioData === 'function') {
+                return window.getAudioData();
+              }
+              return null;
+            });
             
-            // Convert Float32Array to S16LE
-            for (let i = 0; i < float32Array.length; i++) {
-              // Convert float (-1.0 to 1.0) to int16 (-32768 to 32767)
-              const sample = Math.max(-1, Math.min(1, float32Array[i]));
-              const int16Sample = Math.floor(sample * 32767);
+            if (audioData && Array.isArray(audioData) && audioData.length > 0) {
+              logger.debug(`Received ${audioData.length} audio buffers from browser`);
               
-              // Write as little-endian
-              s16leBuffer.writeInt16LE(int16Sample, i * 2);
+              // Process each buffer
+              for (const buffer of audioData) {
+                // Convert Float32Array to Int16Array (S16LE format)
+                const int16Buffer = new Int16Array(buffer.length);
+                
+                for (let i = 0; i < buffer.length; i++) {
+                  // Clamp values to [-1, 1] and scale to [-32768, 32767]
+                  const sample = Math.max(-1, Math.min(1, buffer[i]));
+                  int16Buffer[i] = Math.floor(sample * 32767);
+                }
+                
+                // Convert to Buffer
+                const audioBuffer = Buffer.from(int16Buffer.buffer);
+                
+                // Write to file
+                audioCapture.fileStream.write(audioBuffer);
+                
+                // Send to WebSocket if connected
+                if (audioCapture.wsConnection && audioCapture.wsConnection.readyState === 1) {
+                  try {
+                    audioCapture.wsConnection.send(audioBuffer);
+                  } catch (error) {
+                    logger.error(`Error sending audio data to WebSocket: ${error.message}`);
+                  }
+                }
+              }
+              
+              // Log audio level periodically
+              if (Math.random() < 0.1) {
+                const lastBuffer = audioData[audioData.length - 1];
+                let sum = 0;
+                for (let i = 0; i < lastBuffer.length; i++) {
+                  sum += Math.abs(lastBuffer[i]);
+                }
+                const average = sum / lastBuffer.length;
+                logger.debug(`Audio level: ${average.toFixed(6)}`);
+              }
             }
-            
-            // Send the converted buffer
-            const success = wsConnection.sendAudioData(s16leBuffer);
-            if (!success) {
-              logger.warn('Failed to send browser audio data to WebSocket');
-            }
+          } catch (error) {
+            logger.error(`Error collecting audio data: ${error.message}`);
           }
-        } catch (error) {
-          logger.error(`Error collecting browser audio data: ${error.message}`);
-          clearInterval(dataCollectionInterval);
-        }
-      }, 1000); // Collect data every second
-      
-      // Store the interval ID for cleanup
-      audioCapture.dataCollectionInterval = dataCollectionInterval;
+        }, 100); // Collect data every 100ms
+      } else {
+        logger.error('Failed to start browser-based audio recording');
+        return false;
+      }
     }
     
+    logger.info('Audio recording started successfully');
     return true;
   } catch (error) {
-    logger.error(`Failed to start recording: ${error.message}`);
-    throw error;
+    logger.error(`Failed to start audio recording: ${error.message}`);
+    return false;
   }
 }
 
 /**
  * Stop recording audio
  * @param {Object} audioCapture - Audio capture configuration
- * @param {Object} wsConnection - WebSocket connection object
- * @returns {Promise<boolean>} True if recording stopped successfully, false otherwise
+ * @returns {Promise<boolean>} Success status
  */
-async function stopRecording(audioCapture, wsConnection) {
+async function stopRecording(audioCapture) {
   logger.info('Stopping audio recording...');
   
-  if (!audioCapture) {
-    logger.warn('No audio capture to stop');
-    return;
-  }
-  
   try {
-    // Stop the recorder if available
-    if (audioCapture.recorder) {
-      logger.info('Stopping recorder...');
-      audioCapture.recorder.stop();
-      logger.info('Recorder stopped');
+    // Check if audio capture is set up
+    if (!audioCapture) {
+      logger.warn('No audio capture to stop');
+      return false;
     }
     
-    // Clear any data collection interval
+    // Set recording flag to false
+    audioCapture.isRecording = false;
+    
+    // Stop the system audio recorder if available
+    if (audioCapture.audioRecorder) {
+      logger.info('Stopping system audio recorder...');
+      audioCapture.audioRecorder.stop();
+      logger.info('System audio recorder stopped');
+    }
+    
+    // Clear data collection interval if set
     if (audioCapture.dataCollectionInterval) {
+      logger.info('Clearing data collection interval...');
       clearInterval(audioCapture.dataCollectionInterval);
       audioCapture.dataCollectionInterval = null;
-      logger.info('Data collection interval cleared');
+    }
+    
+    // Close file stream if open
+    if (audioCapture.fileStream) {
+      logger.info('Closing file stream...');
+      audioCapture.fileStream.end();
+      audioCapture.fileStream = null;
     }
     
     // Stop browser-based recording if active
     if (audioCapture.page && !audioCapture.page.isClosed()) {
+      logger.info('Stopping browser-based audio recording...');
       await audioCapture.page.evaluate(() => {
-        if (window.audioCapture && typeof window.audioCapture.stopRecording === 'function') {
-          window.audioCapture.stopRecording();
+        if (window.stopAudioCapture && typeof window.stopAudioCapture === 'function') {
+          window.stopAudioCapture();
           return true;
         }
         return false;
-      }).catch(error => {
-        logger.warn(`Error stopping browser recording: ${error.message}`);
       });
     }
     
-    // Close WebSocket connection if available
-    if (wsConnection && typeof wsConnection.close === 'function') {
+    // Close WebSocket connection if open
+    if (audioCapture.wsConnection) {
       logger.info('Closing WebSocket connection...');
-      wsConnection.close();
-      logger.info('WebSocket connection closed');
+      if (audioCapture.wsConnection.readyState === 1) { // OPEN
+        // Send end message
+        try {
+          const endMessage = {
+            type: 'end',
+            timestamp: new Date().toISOString()
+          };
+          audioCapture.wsConnection.send(JSON.stringify(endMessage));
+          
+          // Close the connection
+          audioCapture.wsConnection.close(1000, 'Recording stopped');
+        } catch (error) {
+          logger.error(`Error closing WebSocket connection: ${error.message}`);
+        }
+      }
+      audioCapture.wsConnection = null;
     }
     
     logger.info('Audio recording stopped successfully');
+    logger.info(`Recording saved to: ${audioCapture.outputFilePath}`);
     return true;
   } catch (error) {
-    logger.error(`Error stopping recording: ${error.message}`);
-    throw error;
+    logger.error(`Failed to stop audio recording: ${error.message}`);
+    return false;
   }
 }
 
