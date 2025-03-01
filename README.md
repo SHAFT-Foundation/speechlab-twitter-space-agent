@@ -61,6 +61,39 @@ node src/index.js --url https://twitter.com/i/spaces/your-space-id
 - `-d, --debug`: Enable debug logging
 - `-t, --test-mode`: Run in test mode without creating Azure VM (uses local browser)
 
+### Multi-Space Capture
+
+Capture audio from multiple Twitter Spaces simultaneously:
+
+```bash
+node multi-space-capture.js [options]
+```
+
+#### Options:
+- `-u, --urls <urls>`: Comma-separated list of Twitter Space URLs to capture
+- `-c, --count <count>`: Number of top spaces to capture if no URLs provided (default: 3)
+- `-d, --debug`: Enable debug logging
+- `-h, --headless`: Run in headless mode (default: false)
+- `-b, --base-port <port>`: Base WebSocket server port (will increment for each space) (default: 8080)
+- `-w, --websocket-urls <urls>`: Comma-separated list of WebSocket URLs to send audio to
+- `-e, --websocket-base <url>`: Base WebSocket URL (will be appended with space index)
+
+#### Examples:
+
+```bash
+# Capture the top 3 Twitter Spaces
+node multi-space-capture.js
+
+# Capture specific Twitter Spaces
+node multi-space-capture.js --urls "https://twitter.com/i/spaces/1dRJZYWDNVrGB,https://twitter.com/i/spaces/1YqKDqVNLAVKV"
+
+# Capture 5 top spaces with debug logging
+node multi-space-capture.js --count 5 --debug
+
+# Capture spaces and send to specific WebSocket endpoints
+node multi-space-capture.js --urls "https://twitter.com/i/spaces/1dRJZYWDNVrGB,https://twitter.com/i/spaces/1YqKDqVNLAVKV" --websocket-urls "wss://example.com/audio1,wss://example.com/audio2"
+```
+
 ## Architecture
 
 The tool consists of several modules:
